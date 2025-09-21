@@ -90,6 +90,13 @@ struct thread
     int priority;                       /* Priority. */
     struct list_elem allelem;           /* List element for all threads list. */
 
+   int64_t wakeup_tick;               /* Tick to wake up thread, for timer_sleep(). */
+
+    int base_priority;                  /* 기부 받기 전의 원래 우선순위 */
+    struct lock *waiting_lock;          /* 현재 이 스레드가 기다리고 있는 lock */
+    struct list donations;              /* 이 스레드에게 우선순위를 기부한 스레드들의 리스트 */
+    struct list_elem donation_elem;     /* 다른 스레드의 donations 리스트에 들어갈 때 사용할 element */
+    
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
@@ -97,6 +104,9 @@ struct thread
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
 #endif
+
+   int nice;
+   int recent_cpu;
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
@@ -137,5 +147,13 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+void thread_donate_priority (struct thread *holder);
+void thread_remove_donations_for_lock (struct lock *lock);
+void thread_recalculate_priority (struct thread *t);
+bool priority_less (const struct list_elem *a, const struct list_elem *b, void *aux);
+
+void test_max_priority(void); 
+
 
 #endif /* threads/thread.h */

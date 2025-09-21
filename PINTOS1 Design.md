@@ -256,9 +256,19 @@ DYING (종료 중): 실행이 끝나고 소멸을 기다리는 상태.
 
 ## 3.1. Alarm Clock
 
-### What Pintos Manual Says?
+### What PINTOS Manual Says?
 
 `devices/timer.c`에 정의된 timer_sleep() 함수를 재구현한다. 작동하는 구현이 제공되지만, 이는 "바쁜 대기", 즉 현재 시간을 확인하고 `thread_yield()`를 호출하는 루프를 돌면서 충분한 시간이 지날 때까지 기다리는 방식이다. 바쁜 대기를 피하도록 재구현한다.
+
+### Why Alarm Clock?
+
+busy waiting을 알람 시계(alarm clock) 방식으로 바꿔야 하는 주요 이유는 **CPU 자원 낭비를 막고 시스템 효율성을 높이기 위해서이다.**
+
+**Busy waiting**은 특정 조건이 충족될 때까지 스레드가 무의미한 반복문을 돌며 지속적으로 CPU를 점유하는 방식이다. 
+**알람 시계** 방식은 스레드가 기다려야 할 시간이 될 때까지 스스로를 **수면(sleep) 상태**로 만들고, 타이머 인터럽트가 발생하면 깨어나도록 하는 방식이다.
+
+결론적으로, 바쁜 대기 방식은 **자원을 낭비하고 비효율적**이지만, 알람 시계 방식은 **CPU 자원을 효율적으로 사용하고 시스템 성능을 최적화**하는 원칙을 따른다.
+
 
 ```c
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
@@ -274,11 +284,420 @@ timer_sleep (int64_t ticks)
 }
 ```
 
-### 
+현재 코드의 문제점은 다음과 같다.
+
+Busy Waiting: while 루프는 계속해서 `timer_elapsed()`를 호출하여 시간을 확인한다. 비록 `thread_yield()`를 통해 다른 스레드에게 CPU를 양보하지만, 이 "잠자는" 스레드는 여전히 Ready 상태로 Ready Queue에 남아있다.
+
+CPU 자원 낭비: 스케줄러는 CPU를 할당할 때마다 Ready Queue에 있는 이 스레드를 불필요하게 고려해야 한다. 스레드는 깨어나자마자 시간을 체크하고 다시 양보하는 일을 반복하며 CPU 사이클을 낭비한다.
+
+스케줄러 부하: 불필요한 문맥 교환(Context Switching)이 계속 발생하여 시스템 전체에 부하를 줍니다.
+
+### Our Design: Alarm Clock(Sleep/Wakeup)
+
+효율적인 방법은 스레드를 Blocked 상태로 만들어 Ready Queue에서 완전히 제외하는 것이다. 스레드는 정해진 시간이 될 때까지 CPU 경쟁에 참여하지 않다가, 시간이 되면 깨어나(unblock) 다시 Ready Queue로 돌아가야 한다.
+
+이를 위한 전체적인 흐름은 다음과 같다.
+
+Sleep 요청: 스레드가 `timer_sleep(n)`을 호출하면, "지금부터 n 틱 후에 깨워달라"고 요청한다.
+
+깨어날 시간 기록: 스레드가 깨어나야 할 정확한 tick 값을 계산하여 어딘가에 저장한다.
+
+대기 리스트 등록 및 Block: 스레드를 잠자는 스레드들을 관리하는 별도의 리스트(예: sleep_list)에 추가하고, `thread_block()`을 호출하여 스스로를 Blocked 상태로 만든다.
+
+시간 확인 (Timer Interrupt): 매 타이머 틱마다 발생하는 `timer_interrupt` 핸들러가 sleep_list를 확인한다.
+
+Wakeup 처리: 현재 시간이 sleep_list에 있는 스레드가 깨어나기로 한 시간과 같거나 지났다면, 해당 스레드를 sleep_list에서 제거하고 `thread_unblock()`을 호출하여 Ready Queue로 옮긴다.
+
+## Our Implementation
+
+### threads/thread.h
+
+```c
+struct thread{
+    int64_t wakeup_tick; 
+};
+```
+`struct thread`에 스레드가 깨어날 시간을 저장할 멤버를 추가해야 한다.
+
+### devices/timer.c
+
+1. 전역 변수 추가
+
+    ```c
+    static struct list sleep_list;
+    ```
+
+    잠자는 스레드들을 관리할 리스트를 static 전역 변수로 선언한다.
+
+2. `timer_init()` 함수 수정
+
+    ```c
+    void
+    timer_init (void) 
+    {
+    pit_configure_channel (0, 2, TIMER_FREQ);
+    intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+
+    /* sleep_list 초기화 */
+    list_init(&sleep_list);
+    }
+    ```
+
+    `timer_init()`과 함께 sleep_list를 초기화해야 한다.
+
+3. `timer_sleep()` 재구현
+
+    ```c
+    void
+    timer_sleep (int64_t ticks) 
+    {
+    if (ticks <= 0) {
+        return;
+    }
+
+    enum intr_level old_level = intr_disable ();
+    
+    struct thread *cur = thread_current ();
+    
+    cur->wakeup_tick = timer_ticks () + ticks;
+    
+    list_insert_ordered (&sleep_list, &cur->elem, wake_less, NULL);
+    
+    thread_block ();
+    
+    intr_set_level (old_level);
+    }
+    ```
+
+    현재 스레드가 깨어나야할 시간을 계산하여 저장하고 스레드를 sleep_list에 추가하고 block 상태로 만든다. 나중에 unblock되면 다시 실행 재개를 한다.
+
+    * 
+        ```c
+        static bool
+        wake_less (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+        {
+            const struct thread *thread_a = list_entry (a, struct thread, elem);
+            const struct thread *thread_b = list_entry (b, struct thread, elem);
+            return thread_a->wakeup_tick < thread_b->wakeup_tick;
+        }
+        ```
+        위 커스텀 함수와 이미 구현된 `list_insert_ordered()`로 `sleep_list`를 오름차순으로 만든다.
 
 
+4. `timer_interrupt()` 함수 수정
 
+    ```c
+    static void
+    timer_interrupt (struct intr_frame *args UNUSED)
+    {
+    ticks++;
+    thread_tick ();
+
+    if(list_empty (&sleep_list)) {
+        return;
+    }
+
+    struct list_elem *e = list_begin (&sleep_list);
+
+    while(e != list_end (&sleep_list)) {
+        struct thread *t = list_entry (e, struct thread, elem);
+        
+        if(ticks >= t->wakeup_tick) {
+        struct list_elem *next = list_next (e);
+        list_remove (e);
+        thread_unblock (t);
+        e = next;
+        } else {
+        break;
+        }
+    }
+    }
+    ```
+
+    기존 주기적으로 호출되어 시스템 틱(tick) 을 증가시키는 것에 더해, 일정 시간이 지난 후 깨워야 할 스레드를 관리하게 한다. 
 
 ## 3.2. Priority Scheduling
 
+### What PINTOS Manual says?
+
+현재 실행 중인 스레드보다 더 높은 우선순위를 가진 스레드가 준비 큐(ready list)에 추가되면, 현재 스레드는 즉시 새로운 스레드에게 프로세서(CPU)를 양보해야 한다. 마찬가지로, 스레드들이 락(lock), 세마포(semaphore), 또는 조건 변수(condition variable)를 기다릴 때에는, 기다리는 스레드들 중 가장 높은 우선순위를 가진 스레드가 먼저 깨어나야 한다. 스레드는 언제든지 자신의 우선순위를 높이거나 낮출 수 있지만, 우선순위를 낮춘 결과 더 이상 가장 높은 우선순위를 갖지 않게 될 경우, 즉시 CPU를 양보해야 한다.
+
+스레드의 우선순위는 PRI_MIN(0)부터 PRI_MAX(63)까지의 범위를 가진다. 숫자가 낮을수록 낮은 우선순위를 의미한다. 스레드의 초기 우선순위는 `thread_create()` 함수의 인자로 전달됩니다. 다른 우선순위를 선택할 특별한 이유가 없다면 PRI_DEFAULT(31)를 사용한다. PRI_ 매크로들은 threads/thread.h에 정의되어 있으며, 이 값들을 변경해서는 안 된다.
+
+우선순위 스케줄러가 만족해야 할 3가지 핵심 규칙
+
++ 선점 (Preemption): 더 높은 우선순위의 스레드가 실행 가능해지면(ready list에 들어오면) 즉시 현재 실행 중인 스레드를 멈추고 CPU를 차지해야 한다.
+
++ 우선순위 기반의 Wake-up: 잠들어 있던 여러 스레드가 동시에 깨어날 때, 우선순위가 가장 높은 스레드부터 깨어나야 한다.
+
++ 우선순위 변경 시 선점: 스레드가 스스로 우선순위를 낮춘 경우, 자신보다 우선순위가 높은 다른 스레드가 있다면 즉시 CPU를 양보해야 한다.
+
+#### 문제점: 우선순위 역전 (Priority Inversion)
+
+우선순위 스케줄링의 한 가지 문제는 **"우선순위 역전(priority inversion)"**이다. 높은, 중간, 낮은 우선순위를 가진 스레드를 각각 H, M, L이라고 가정해 보자. 만약 H가 L이 점유한 락을 기다려야 하고, M이 준비 큐에 있다면, H는 결코 CPU를 얻지 못할 것이다. 왜냐하면 낮은 우선순위의 스레드 L이 CPU 시간을 얻지 못해 락을 놓아주지 못하기 때문이다.
+
+우선순위 역전은 우선순위가 높은 스레드가 자신보다 낮은 스레드의 작업이 끝나기를 기다리느라 아무 일도 못 하는 비효율적인 상황을 말한다.
+
+#### 해결책: 우선순위 기부 (Priority Donation)
+
+이 문제에 대한 부분적인 해결책은, L이 락을 보유하고 있는 동안 H가 자신의 우선순위를 L에게 **"기부(donate)"**하고, L이 락을 해제하면(그리하여 H가 락을 획득하면) 기부를 철회하는 것이다.
+
+우선순위 기부가 필요한 모든 다양한 상황들을 고려해야 합니다. 여러 스레드가 하나의 스레드에게 우선순위를 기부하는 **다중 기부(multiple donations)** 를 반드시 처리해야 한다. 또한 **중첩된 기부(nested donation)**도 처리해야 한다. 예를 들어, H가 M이 보유한 락을 기다리고, M은 L이 보유한 락을 기다린다면, M과 L은 모두 H의 우선순위로 올라가야 한다. 
+
+우선순위 기부는 락을 기다리는 스레드가 자신의 높은 우선순위를 락을 보유한 낮은 우선순위의 스레드에게 일시적으로 빌려주는 것이다.
+
+#### 구현 목표
+
+`void thread_set_priority (int new_priority)`: 현재 스레드의 우선순위를 new_priority로 설정한다.
+만약 이 변경으로 인해 현재 스레드가 더 이상 가장 높은 우선순위가 아니게 되면, CPU를 양보(yield)한다.
+
+`int thread_get_priority (void)`: 현재 스레드의 우선순위를 반환합니다. 우선순위 기부를 받은 상태라면, 더 높은 (기부받은) 우선순위를 반환해야 합니다.
+
+### Our Desgin
+
+현재의 scheduling 방식은 thread의 우선순위를 고려하지 않고, FIFO 기반으로 생성 순서에 따라 Round-Robin 방식을 채택하고 있다.
+스레드의 중요도에 따라 CPU 자원을 효과적으로 배분하고, 시스템 응답성을 높이며, 다양한 운영체제 시나리오를 제대로 지원하기 위해서 우선순위 스케줄러를 구현한다.
+
+#### 📋 구현할 기능 목록
+우선순위 기반 스케줄링
+
+ready_list(준비 큐)에서 항상 우선순위가 가장 높은 스레드를 찾아 실행해야 합니다.
+
+더 높은 우선순위의 스레드가 실행 가능해지면, 즉시 현재 실행 중인 스레드를 멈추고(선점) 새 스레드를 실행해야 합니다.
+
+동기화 객체 처리
+
+Lock, 세마포 등에서 잠자던 스레드를 깨울 때, 기다리는 스레드 중 가장 우선순위가 높은 스레드를 먼저 깨워야 합니다.
+
+우선순위 기부 (Priority Donation)
+
+우선순위 역전(Priority Inversion) 문제를 해결하기 위한 기능입니다.
+
+이 기능은 Lock에 대해서만 구현하면 됩니다.
+
+여러 스레드가 하나의 스레드에게 기부하는 다중 기부와, 기부가 연쇄적으로 일어나는 중첩 기부(H→M→L) 상황을 모두 처리해야 합니다.
+
+### Our Implementation
+
+Priority Scheduler 구현 핵심은 (1) Ready 리스트를 우선순위 큐로 만들기, (2) 우선순위 기부 구현하기 두 가지이다.
+
+#### 0. 사전 준비
+
+```c
+struct thread{
+    int base_priority;                  /* 기부 받기 전의 원래 우선순위 */
+    struct lock *waiting_lock;          /* 현재 이 스레드가 기다리고 있는 lock */
+    struct list donations;              /* 이 스레드에게 우선순위를 기부한 스레드들의 리스트 */
+    struct list_elem donation_elem;     /* 다른 스레드의 donations 리스트에 들어갈 때 사용할 element */
+}
+```
+
+우선순위 스케줄링과 기부에 필요한 정보를 `struct thread`에 추가해야 한다.
+
+---
+
+```c
+// synch.h
+
+struct lock {
+    struct thread *holder;      /* Thread holding lock (for debugging). */
+    struct semaphore semaphore; /* Binary semaphore controlling access. */
+
+    struct list waiters; 
+};
+```
+
+추가로 `strcut lock`에 lock을 기다리는 thread list를 만든다.
+
+#### 1. Ready 리스트를 우선순위 큐로 만들기
+
+현재 `ready_list`는 단순한 FIFO(선입선출) 큐이다. 이것을 우선순위가 높은 스레드가 항상 먼저 나올 수 있도록 수정해야 한다. 가장 좋은 방법은 `ready_list`를 항상 우선순위 순으로 정렬된 상태로 유지하는 것이다. 
+
+`thread_unblock()`, `thread_yield()` 두 함수 내부에 있는 list_push_back (&ready_list, ...) 코드를 list_insert_ordered()로 변경해야 한다.
+
+```c
+void
+thread_unblock (struct thread *t) 
+{
+  enum intr_level old_level;
+
+  ASSERT (is_thread (t));
+
+  old_level = intr_disable ();
+  ASSERT (t->status == THREAD_BLOCKED);
+  list_insert_ordered (&ready_list, &t->elem, priority_less, NULL);
+  t->status = THREAD_READY;
+  intr_set_level (old_level);
+}
+```
+
+`thread_yield()`도 이와 마찬가지로 `list_insert_ordered()`로 변경한다.
+
+---
+
+```c
+bool
+priority_less (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+    const struct thread *thread_a = list_entry (a, struct thread, elem);
+    const struct thread *thread_b = list_entry (b, struct thread, elem);
+    return thread_a->priority > thread_b->priority;
+}
+```
+
+`list_insert_ordered`에 쓰일 우선순위 비교를 위한 함수도 추가하여 준다.
+
+
+
+#### 2. 우선순위 기부 구현하기
+
+우선순위 기부를 처리하려면 스레드의 기본(base) 우선순위와 기부받은 것까지 포함한 실질(effective) 우선순위를 구분해야 한다.
+
+```c
+static void
+init_thread (struct thread *t, const char *name, int priority){
+    t->priority = priority;
+
+    t->base_priority = priority;
+    t->waiting_lock = NULL;
+    list_init (&t->donations);
+}
+```
+
+먼저, 0단계에서 추가한 멤버들을 초기화한다.
+
+---
+
+더 높은 우선순위의 스레드가 실행 가능 상태가 되면, 현재 실행 중인 스레드는 즉시 CPU를 양보해야 한다.
+
+```c
+static void
+test_max_priority (void)
+{
+  if (list_empty(&ready_list))
+    return;
+  
+  struct thread *next_thread = list_entry(list_front(&ready_list), struct thread, elem);
+  if (thread_current()->priority < next_thread->priority)
+    {
+      thread_yield();
+    }
+}
+```
+
+현재 실행중인 스레드보다 ready_list에 있는 가장 우선순위 높은 스레드가 더 높은 우선순위를 가질 경우 CPU를 양보하도록 하는 함수이다.
+이 함수를 `thread_create`에 추가하여준다.
+
+```c
+tid_t
+thread_create (const char *name, int priority, thread_func *function, void *aux) {
+/* Stack frame for switch_threads(). */
+  sf = alloc_frame (t, sizeof *sf);
+  sf->eip = switch_entry;
+  sf->ebp = 0;
+
+  /* Add to run queue. */
+  thread_unblock (t);
+  test_max_priority();
+
+  return tid;
+}
+```
+
+---
+
+
+```c
+void
+thread_set_priority (int new_priority) 
+{
+  if (thread_mlfqs) {
+    return;
+  }
+
+  thread_current ()->base_priority = new_priority;
+  thread_recalculate_priority(thread_current()); // 기부 상태를 고려하여 실질 우선순위 재계산
+  test_max_priority(); // 선점 확인
+}
+```
+이 함수는 이제 스레드의 '기본' 우선순위를 바꾸고, 그에 따라 실질 우선순위를 재계산한 뒤 선점을 확인해야 한다.
+
+`thread_get_priority()`의 경우는 thread_current ()->priority를 반환하면 되므로, 수정할 필요가 없다. 이미 priority 멤버가 실질 우선순위를 나타내도록 관리되기 때문이다.
+
+```c
+void
+thread_recalculate_priority (struct thread *t)
+{
+  int max_priority = t->base_priority;
+
+  if (!list_empty(&t->donations))
+  {
+    struct list_elem *e;
+    for (e = list_begin(&t->donations); e != list_end(&t->donations); e = list_next(e))
+    {
+      struct thread *donor = list_entry(e, struct thread, donation_elem);
+      if (donor->priority > max_priority) {
+        max_priority = donor->priority;
+      }
+    }
+  }
+
+  t->priority = max_priority;
+}
+```
+
+우선순위 기부(priority donation) 메커니즘에 따라 스레드의 실행 우선순위를 재계산한다.
+여러 스레드가 기부한 우선순위를 종합하여, 최종적으로 반드시 가장 높은 우선순위를 가지도록 보장한다.
+
+---
+
+
+lock aquire/lock release
+
 ## 3.3. Advanced Scheduler
+
+### What PINTOS Manual says?
+
+4.4BSD 스케줄러와 유사한 다단계 피드백 큐 스케줄러를 구현해야 한다. 이 스케줄러는 시스템에서 실행 중인 작업들의 평균 응답 시간을 줄이는 것이 목적이다. 우선순위 스케줄러처럼, 고급 스케줄러도 우선순위에 따라 실행할 스레드를 선택하지만 우선순위 기부(priority donation)는 하지 않습니다.
+
+### Why Adnvaced Scheduler?
+
+기존 우선순위 스케줄러의 문제점은 **"기아 상태(Starvation)"**입니다. 우선순위가 낮은 스레드는 높은 스레드가 계속 나타나면 영원히 실행되지 못할 수 있습니다.
+
+**Advanced Scheduler(MLFQS)**는 이 문제를 해결하기 위해 다음 두 가지 철학을 따릅니다.
+
+최근에 CPU를 많이 사용한 스레드는 인기가 없다: 이런 스레드는 다른 스레드를 위해 양보해야 하므로, 우선순위를 낮춥니다. (주로 계산 위주의 작업)
+
+최근에 CPU를 거의 사용하지 않은 스레드는 중요하다: 이런 스레드는 사용자의 입력을 기다리는 등 상호작용(interactive) 작업일 가능성이 높으므로, 우선순위를 높여서 빨리 반응할 수 있게 해줍니다.
+
+결론적으로, 모든 스레드에게 공평한 기회를 주되, 응답성이 중요한 스레드를 우대하는 것이 이 스케줄러의 목표입니다.
+
+#### "어떻게?" - 세 가지 핵심 변수
+이 동적인 우선순위 조절은 세 가지 변수를 통해 이루어집니다. (이 변수들은 Appendix B에 자세히 설명되어 있습니다.)
+
+nice: 스레드가 얼마나 "착한지"를 나타내는 값. 사용자가 스레드의 우선순위에 영향을 줄 수 있는 유일한 방법입니다. 값이 높을수록 이타적이므로 우선순위가 낮아지고, 낮을수록(음수) 이기적이므로 우선순위가 높아집니다.
+
+recent_cpu: 스레드가 최근에 얼마나 많은 CPU 시간을 사용했는지를 나타내는 값입니다. 시간이 지남에 따라 점차 감소(decay)하며, 이 값이 높을수록 우선순위는 낮아집니다.
+
+load_avg: 시스템 전체가 얼마나 바쁜지를 나타내는 값. 현재 실행 가능한(Ready 또는 Running) 스레드의 수에 따라 결정되며, recent_cpu가 얼마나 빨리 감소할지에 영향을 줍니다.
+
+이 변수들을 이용해 스레드의 priority를 주기적으로 재계산하게 됩니다.
+
+#### 3. 가장 큰 장애물: 고정 소수점 연산 (Fixed-Point Arithmetic)
+Pintos 커널에서는 부동 소수점(floating point) 연산을 사용할 수 없습니다. 하지만 위 변수들을 계산하는 공식에는 소수 연산이 필요합니다. 이 문제를 해결하기 위해 고정 소수점(Fixed-Point) 방식을 직접 구현해야 합니다.
+
+Pintos에서는 보통 17.14 형식을 사용합니다. 이는 32비트 정수를 다음과 같이 나누어 사용하는 것입니다.
+
+상위 17비트: 정수 부분
+
+하위 14비트: 소수 부분
+
+맨 앞 1비트: 부호 비트
+
+이 연산을 쉽게 하기 위해, threads/fixed-point.h 라는 새 헤더 파일을 만들고 그 안에 아래와 같은 매크로들을 정의하는 것을 강력히 추천합니다.
+
+### Our Design
+
+
+
+
