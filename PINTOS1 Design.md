@@ -210,7 +210,7 @@ DYING (종료 중): 실행이 끝나고 소멸을 기다리는 상태.
 
 * Idle Thread
 
-항상 가장 낮은 우선순위로 동작하며, ready 큐에 실행 가능한 스레드가 없을 때만 실질적으로 CPU를 점유한다. 운영체제의 스케줄러가 특별한 예외상황을 처리하지 않고, 언제나 실행 가능한 스레드(idle thread)가 존재한다는 전제로 단순하고 일관적인 구조를 유지할 수 있다.idle thread가 존재하지 않으면, ready queue가 비어있을 때 스케줄러 오류가 발생할 수 있다.
+  항상 가장 낮은 우선순위로 동작하며, ready 큐에 실행 가능한 스레드가 없을 때만 실질적으로 CPU를 점유한다. 운영체제의 스케줄러가 특별한 예외상황을 처리하지 않고, 언제나 실행 가능한 스레드(idle thread)가 존재한다는 전제로 단순하고 일관적인 구조를 유지할 수 있다.idle thread가 존재하지 않으면, ready queue가 비어있을 때 스케줄러 오류가 발생할 수 있다.
 
 ### 스레드 생성 및 종료
 
@@ -458,30 +458,11 @@ struct thread{
 현재의 scheduling 방식은 thread의 우선순위를 고려하지 않고, FIFO 기반으로 생성 순서에 따라 Round-Robin 방식을 채택하고 있다.
 스레드의 중요도에 따라 CPU 자원을 효과적으로 배분하고, 시스템 응답성을 높이며, 다양한 운영체제 시나리오를 제대로 지원하기 위해서 우선순위 스케줄러를 구현한다.
 
-#### 📋 구현할 기능 목록
-우선순위 기반 스케줄링
-
-ready_list(준비 큐)에서 항상 우선순위가 가장 높은 스레드를 찾아 실행해야 합니다.
-
-더 높은 우선순위의 스레드가 실행 가능해지면, 즉시 현재 실행 중인 스레드를 멈추고(선점) 새 스레드를 실행해야 합니다.
-
-동기화 객체 처리
-
-Lock, 세마포 등에서 잠자던 스레드를 깨울 때, 기다리는 스레드 중 가장 우선순위가 높은 스레드를 먼저 깨워야 합니다.
-
-우선순위 기부 (Priority Donation)
-
-우선순위 역전(Priority Inversion) 문제를 해결하기 위한 기능입니다.
-
-이 기능은 Lock에 대해서만 구현하면 됩니다.
-
-여러 스레드가 하나의 스레드에게 기부하는 다중 기부와, 기부가 연쇄적으로 일어나는 중첩 기부(H→M→L) 상황을 모두 처리해야 합니다.
-
 ### Our Implementation
 
 Priority Scheduler 구현 핵심은 (1) Ready 리스트를 우선순위 큐로 만들기, (2) 우선순위 기부 구현하기 두 가지이다.
 
-#### 0. 사전 준비
+#### 0. 자료구조 준비
 
 ```c
 struct thread{
@@ -533,6 +514,50 @@ thread_unblock (struct thread *t)
 
 `thread_yield()`도 이와 마찬가지로 `list_insert_ordered()`로 변경한다.
 
+`synch.c`에서도 thread를 대기시키는 곳이 있는데, 이 부분도 마찬가지로 모두 수정해야 한다.
+`sema_down()`, `cond_wait()`, `cond_signal()`이다.
+
+`sema_down()`, `cond_wait()`은 위와 동일하게 `list_insert_ordered()`로 변경하고,
+`cond_signal()`은 아래와 같이 비교함수를 추가하여 정렬한다.
+
+
+```c
+// synch.c
+
+bool conditional_var_comparator(struct list_elem *a,struct list_elem *b, void *aux){
+
+  struct semaphore_elem *semaphore_one = list_entry(a,struct semaphore_elem,elem);
+  struct semaphore_elem *semaphore_two = list_entry(b,struct semaphore_elem,elem);
+
+  struct thread *s_one= list_entry(list_front(&semaphore_one->semaphore.waiters), struct thread, elem);
+  struct thread *s_two= list_entry(list_front(&semaphore_two->semaphore.waiters), struct thread, elem);
+
+  if(s_one->priority > s_two->priority)
+    return true;
+  else return false;
+}
+
+
+void
+sema_down (struct semaphore *sema) 
+{
+  enum intr_level old_level;
+
+  ASSERT (sema != NULL);
+  ASSERT (!intr_context ());
+
+  old_level = intr_disable ();
+  while (sema->value == 0) 
+    {
+      list_insert_ordered(&sema->waiters, &thread_current()->elem, priority_less, NULL);
+      thread_block ();
+    }
+  sema->value--;
+  intr_set_level (old_level);
+}
+
+```
+
 ---
 
 ```c
@@ -546,8 +571,6 @@ priority_less (const struct list_elem *a, const struct list_elem *b, void *aux U
 ```
 
 `list_insert_ordered`에 쓰일 우선순위 비교를 위한 함수도 추가하여 준다.
-
-
 
 #### 2. 우선순위 기부 구현하기
 
@@ -651,53 +674,382 @@ thread_recalculate_priority (struct thread *t)
 
 ---
 
+```c
+void
+thread_donate_priority (struct thread *holder)
+{
+  if (holder == NULL) return;
+  
+  struct thread *donor = thread_current();
+  
+  list_push_back(&holder->donations, &donor->donation_elem);
+  
+  while(holder) {
+    thread_recalculate_priority(holder);
+    if (holder->waiting_lock) {
+      holder = holder->waiting_lock->holder;
+    } else {
+      break;
+    }
+  }
+}
+```
 
-lock aquire/lock release
+현재 실행 중인 스레드(기부자)의 우선순위를 락을 점유하고 있는 스레드(소유자)에게 기부한다.
+이 과정에서 우선순위 역전 문제를 완화하기 위해, 락 대기 중인 여러 스레드에 걸쳐 우선순위 기부가 연쇄적으로 전파되는 구조를 채택했다.
+
+
+```c
+//synch.c
+
+void
+lock_acquire (struct lock *lock)
+{
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (!lock_held_by_current_thread (lock));
+
+  struct thread *cur = thread_current();
+
+  if (lock->holder != NULL)
+  {
+    cur->waiting_lock = lock;
+    thread_donate_priority(lock->holder);
+  }
+
+  sema_down (&lock->semaphore);
+  lock->holder = cur;
+  cur->waiting_lock = NULL;
+}
+```
+
+만약 lock이 다른 스레드에 의해 소유되고 있으면, 현재 스레드는 이 락을 기다리고 있다고 표시하고
+락을 가진 스레드에게 현재 스레드 우선순위를 기부한다.
+
+---
+
+```c
+void
+thread_remove_donations_for_lock (struct lock *lock)
+{
+  struct thread *cur = thread_current();
+  struct list_elem *e;
+
+  for (e = list_begin(&cur->donations); e != list_end(&cur->donations); )
+  {
+    struct thread *donor = list_entry(e, struct thread, donation_elem);
+    if (donor->waiting_lock == lock) {
+      e = list_remove(e);
+    } else {
+      e = list_next(e);
+    }
+  }
+}
+```
+현재 스레드가 가지고 있는 우선순위 기부 목록(donations) 중 특정 락(lock)에 관련된 기부를 제거하는 기능을 수행한다.
+락을 해제하거나 더 이상 기부가 필요 없을 때 해당 락에 대한 기부 기록을 제거하는 용도로 사용된다.
+
+```c
+// synch.c
+
+void
+lock_release (struct lock *lock) 
+{
+  ASSERT (lock != NULL);
+  ASSERT (lock_held_by_current_thread (lock));
+
+  struct thread *cur = thread_current();
+
+  thread_remove_donations_for_lock(lock);
+  thread_recalculate_priority(cur);
+
+  lock->holder = NULL;
+  sema_up (&lock->semaphore);
+}
+```
+현재 스레드가 가지고 있는 락을 해제하고, 우선순위 기부 상태를 갱신하는 역할을 수행한다.
+
 
 ## 3.3. Advanced Scheduler
 
 ### What PINTOS Manual says?
 
-4.4BSD 스케줄러와 유사한 다단계 피드백 큐 스케줄러를 구현해야 한다. 이 스케줄러는 시스템에서 실행 중인 작업들의 평균 응답 시간을 줄이는 것이 목적이다. 우선순위 스케줄러처럼, 고급 스케줄러도 우선순위에 따라 실행할 스레드를 선택하지만 우선순위 기부(priority donation)는 하지 않습니다.
+4.4BSD 스케줄러와 유사한 다단계 피드백 큐 스케줄러를 구현해야 한다. 이 스케줄러는 시스템에서 실행 중인 작업들의 평균 응답 시간을 줄이는 것이 목적이다. 우선순위 스케줄러처럼, 고급 스케줄러도 우선순위에 따라 실행할 스레드를 선택하지만 우선순위 기부(priority donation)는 하지 않는다.
 
 ### Why Adnvaced Scheduler?
 
-기존 우선순위 스케줄러의 문제점은 **"기아 상태(Starvation)"**입니다. 우선순위가 낮은 스레드는 높은 스레드가 계속 나타나면 영원히 실행되지 못할 수 있습니다.
+기존 우선순위 스케줄러의 문제점은 **"기아 상태(Starvation)"**이다. 우선순위가 낮은 스레드는 높은 스레드가 계속 나타나면 영원히 실행되지 못할 수 있다.
 
-**Advanced Scheduler(MLFQS)**는 이 문제를 해결하기 위해 다음 두 가지 철학을 따릅니다.
+**Advanced Scheduler(MLFQS)**는 이 문제를 해결하기 위해 다음 두 가지 철학을 따른다.
 
-최근에 CPU를 많이 사용한 스레드는 인기가 없다: 이런 스레드는 다른 스레드를 위해 양보해야 하므로, 우선순위를 낮춥니다. (주로 계산 위주의 작업)
+최근에 CPU를 많이 사용한 스레드는 인기가 없다: 이런 스레드는 다른 스레드를 위해 양보해야 하므로, 우선순위를 낮춘다. (주로 계산 위주의 작업)
 
-최근에 CPU를 거의 사용하지 않은 스레드는 중요하다: 이런 스레드는 사용자의 입력을 기다리는 등 상호작용(interactive) 작업일 가능성이 높으므로, 우선순위를 높여서 빨리 반응할 수 있게 해줍니다.
+최근에 CPU를 거의 사용하지 않은 스레드는 중요하다: 이런 스레드는 사용자의 입력을 기다리는 등 상호작용(interactive) 작업일 가능성이 높으므로, 우선순위를 높여서 빨리 반응할 수 있게 해준다.
 
 결론적으로, 모든 스레드에게 공평한 기회를 주되, 응답성이 중요한 스레드를 우대하는 것이 이 스케줄러의 목표입니다.
 
-#### "어떻게?" - 세 가지 핵심 변수
-이 동적인 우선순위 조절은 세 가지 변수를 통해 이루어집니다. (이 변수들은 Appendix B에 자세히 설명되어 있습니다.)
+#### How to implement?
 
-nice: 스레드가 얼마나 "착한지"를 나타내는 값. 사용자가 스레드의 우선순위에 영향을 줄 수 있는 유일한 방법입니다. 값이 높을수록 이타적이므로 우선순위가 낮아지고, 낮을수록(음수) 이기적이므로 우선순위가 높아집니다.
+이 동적인 우선순위 조절은 세 가지 변수를 통해 이루어진다.
 
-recent_cpu: 스레드가 최근에 얼마나 많은 CPU 시간을 사용했는지를 나타내는 값입니다. 시간이 지남에 따라 점차 감소(decay)하며, 이 값이 높을수록 우선순위는 낮아집니다.
+nice: 스레드가 얼마나 "착한지"를 나타내는 값. 사용자가 스레드의 우선순위에 영향을 줄 수 있는 유일한 방법이다. 값이 높을수록 이타적이므로 우선순위가 낮아지고, 낮을수록(음수) 이기적이므로 우선순위가 높아진다.
 
-load_avg: 시스템 전체가 얼마나 바쁜지를 나타내는 값. 현재 실행 가능한(Ready 또는 Running) 스레드의 수에 따라 결정되며, recent_cpu가 얼마나 빨리 감소할지에 영향을 줍니다.
+recent_cpu: 스레드가 최근에 얼마나 많은 CPU 시간을 사용했는지를 나타내는 값이다. 시간이 지남에 따라 점차 감소(decay)하며, 이 값이 높을수록 우선순위는 낮아진다.
 
-이 변수들을 이용해 스레드의 priority를 주기적으로 재계산하게 됩니다.
+load_avg: 시스템 전체가 얼마나 바쁜지를 나타내는 값. 현재 실행 가능한(Ready 또는 Running) 스레드의 수에 따라 결정되며, recent_cpu가 얼마나 빨리 감소할지에 영향을 준다.
 
-#### 3. 가장 큰 장애물: 고정 소수점 연산 (Fixed-Point Arithmetic)
-Pintos 커널에서는 부동 소수점(floating point) 연산을 사용할 수 없습니다. 하지만 위 변수들을 계산하는 공식에는 소수 연산이 필요합니다. 이 문제를 해결하기 위해 고정 소수점(Fixed-Point) 방식을 직접 구현해야 합니다.
+이 변수들을 이용해 스레드의 priority를 주기적으로 재계산하게 된다.
 
-Pintos에서는 보통 17.14 형식을 사용합니다. 이는 32비트 정수를 다음과 같이 나누어 사용하는 것입니다.
+*고정 소수점 연산 (Fixed-Point Arithmetic)*: Pintos 커널에서는 부동 소수점(floating point) 연산을 사용할 수 없다. 하지만 위의 세 가지 변수들을 계산하는 공식에는 소수 연산이 필요하다. 이 문제를 해결하기 위해 고정 소수점(Fixed-Point) 방식을 직접 구현해야 한다. 이 연산을 쉽게 하기 위해, threads/fixed-point.h 라는 새 헤더 파일을 만들고 매크로를 쓰는 것이 편하다
 
-상위 17비트: 정수 부분
+### Our Implementation
 
-하위 14비트: 소수 부분
+#### 고정 소수점 연산
 
-맨 앞 1비트: 부호 비트
+```c
+// fixed-point.h
 
-이 연산을 쉽게 하기 위해, threads/fixed-point.h 라는 새 헤더 파일을 만들고 그 안에 아래와 같은 매크로들을 정의하는 것을 강력히 추천합니다.
+#ifndef THREADS_FIXED_POINT_H
+#define THREADS_FIXED_POINT_H
 
-### Our Design
+#define F (1 << 14)
+
+#define INT_TO_FP(n) ((n) * F)
+
+#define FP_TO_INT_ZERO(x) ((x) / F)
+
+#define FP_TO_INT_NEAREST(x) ((x) >= 0 ? ((x) + F / 2) / F : ((x) - F / 2) / F)
+
+#define FP_ADD(x, y) ((x) + (y))
+#define FP_SUB(x, y) ((x) - (y))
+#define FP_ADD_INT(x, n) ((x) + (n) * F)
+#define FP_SUB_INT(x, n) ((x) - (n) * F)
+
+#define FP_MUL(x, y) (((int64_t)(x)) * (y) / F)
+#define FP_MUL_INT(x, n) ((x) * (n))
+#define FP_DIV(x, y) (((int64_t)(x)) * F / (y))
+#define FP_DIV_INT(x, n) ((x) / (n))
+
+#endif 
+```
+
+위에서 요구한대로 새로이 fixed-point.h를 만들고 매크로를 사용한다.
+
+```txt
+Convert n to fixed point:	n * f
+Convert x to integer (rounding toward zero):	x / f
+Convert x to integer (rounding to nearest):	(x + f / 2) / f if x >= 0,
+(x - f / 2) / f if x <= 0.
+Add x and y:	x + y
+Subtract y from x:	x - y
+Add x and n:	x + n * f
+Subtract n from x:	x - n * f
+Multiply x by y:	((int64_t) x) * y / f
+Multiply x by n:	x * n
+Divide x by y:	((int64_t) x) * f / y
+Divide x by n:	x / n
+```
+
+위의 핀토스 메뉴얼의 Reference Guide B.6.을 참고하여 코드를 작성하였다.
+
+#### 자료구조 추가
 
 
+```c
+//thread.h
 
+struct thread{
+  int nice;
+  int recent_cpu;
+}
+```
 
+```c
+//thread.c
+
+static int load_avg;
+```
+
+우선순위 조절을 위한 세 가지 변수 nice, recent_cpu, load_avg를 추가하여 준다.
+
+```c
+void
+thread_init (void) 
+{
+  load_avg = 0;
+}
+```
+
+`load_avg`는 `thread_init()`에서 추가하여 준다.
+
+#### MLFQS 스케줄러 구현
+
+```c
+void
+thread_tick (void) 
+{
+  struct thread *t = thread_current ();
+
+  /* Update statistics. */
+  if (t == idle_thread)
+    idle_ticks++;
+#ifdef USERPROG
+  else if (t->pagedir != NULL)
+    user_ticks++;
+#endif
+  else
+    kernel_ticks++;
+
+  if (thread_mlfqs)
+  {
+    /* 매 틱마다: 현재 스레드(idle 제외)의 recent_cpu 1 증가 */
+    if (t != idle_thread)
+      t->recent_cpu = FP_ADD_INT(t->recent_cpu, 1);
+
+    /* 매 4틱마다: 모든 스레드의 priority 재계산 */
+    if (timer_ticks() % TIME_SLICE == 0)
+      thread_foreach(mlfqs_recalculate_priority, NULL);
+
+    /* 매 1초마다: load_avg와 모든 스레드의 recent_cpu 재계산 */
+    if (timer_ticks() % TIMER_FREQ == 0)
+    {
+      mlfqs_recalculate_load_avg();
+      thread_foreach(mlfqs_recalculate_recent_cpu, NULL);
+    }
+  }
+
+  /* Enforce preemption. */
+  if (++thread_ticks >= TIME_SLICE)
+    intr_yield_on_return ();
+}
+```
+
+기존 코드에서 `if(thread_mlfqs)` 부분이 추가되었다.
+
+핀토스 메뉴얼의 Reference Guide B.4.4BSD Scheduler를 참고하면,
+
++ 매 틱마다 현재 스레드의 recent_cpu를 1씩 증가
+
++ 매 4 틱마다 모든 스레드에 대해 우선순위 재계산
+
++ 매 1초마다 load_avg와 모든 스레드의 recent_cpu 재계산
+
+다음과 같은 내용이 나와있어 이를 적용하였다.
+
+```c
+static void
+mlfqs_recalculate_priority (struct thread *t, void *aux UNUSED)
+{
+  if (t != idle_thread)
+  {
+    int term1 = FP_TO_INT_NEAREST (FP_DIV_INT (t->recent_cpu, 4));
+    int term2 = t->nice * 2;
+    int new_priority = PRI_MAX - term1 - term2;
+
+    if (new_priority > PRI_MAX)
+      t->priority = PRI_MAX;
+    else if (new_priority < PRI_MIN)
+      t->priority = PRI_MIN;
+    else
+      t->priority = new_priority;
+  }
+}
+
+static void
+mlfqs_recalculate_recent_cpu (struct thread *t, void *aux UNUSED)
+{
+  if (t != idle_thread)
+    {
+      int load_x_2 = FP_MUL_INT (load_avg, 2);
+      int decay_coeff = FP_DIV (load_x_2, FP_ADD_INT (load_x_2, 1));
+      
+      t->recent_cpu = FP_ADD_INT (FP_MUL (decay_coeff, t->recent_cpu), t->nice);
+    }
+}
+
+static void
+mlfqs_recalculate_load_avg (void)
+{
+  int ready_threads = list_size (&ready_list);
+  if (thread_current () != idle_thread)
+      ready_threads++;
+
+  int term1 = FP_MUL (FP_DIV_INT (INT_TO_FP (59), 60), load_avg);
+  int term2 = FP_MUL_INT (FP_DIV_INT (INT_TO_FP (1), 60), ready_threads);
+  
+  load_avg = FP_ADD (term1, term2);
+}
+```
+
+위는 MLFQS 헬퍼 함수들이다. 기존 우선순위 스케줄러와 달리 Donation logic도 제외하여야 하고 recent_cpu와 load_avg는
+재계산이 필요한 작업이므로 다음과 같은 헬퍼 함수를 추가하였다.
+
+---
+
+```c
+/* Returns the current thread's priority. */
+int
+thread_get_priority (void) 
+{
+  return thread_current ()->priority;
+}
+
+/* Sets the current thread's nice value to NICE. */
+void
+thread_set_nice (int nice) 
+{
+  struct thread *cur = thread_current();
+  cur->nice = nice;
+  mlfqs_recalculate_priority(cur, NULL);
+  test_max_priority();
+}
+
+/* Returns the current thread's nice value. */
+int
+thread_get_nice (void) 
+{
+  return thread_current()->nice;
+}
+
+/* Returns 100 times the system load average. */
+int
+thread_get_load_avg (void) 
+{
+  return FP_TO_INT_NEAREST(FP_MUL_INT(load_avg, 100));
+}
+
+/* Returns 100 times the current thread's recent_cpu value. */
+int
+thread_get_recent_cpu (void) 
+{
+  return FP_TO_INT_NEAREST(FP_MUL_INT(thread_current()->recent_cpu, 100));
+}
+```
+
+MLFQS 스케줄러의 인터페이스 함수들은 다음과 같이 구현하였다.
+
+#### Donation 비활성화
+
+```c
+void
+lock_acquire (struct lock *lock)
+{
+  if (thread_mlfqs) {
+      sema_down(&lock->semaphore);
+      lock->holder = thread_current();
+      return;
+  }
+}
+
+void
+lock_release (struct lock *lock) 
+{
+  if (thread_mlfqs) {
+      lock->holder = NULL;
+      sema_up(&lock->semaphore);
+      return;
+  }
+}
+```
+
+3.2.의 우선순위 스케줄러와 다르게 여기서는 donation 고려하지 않으므로 이 logic을 동기화에도 추가하여준다. 
