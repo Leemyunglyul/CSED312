@@ -269,7 +269,6 @@ busy waiting을 알람 시계(alarm clock) 방식으로 바꿔야 하는 주요 
 
 결론적으로, 바쁜 대기 방식은 **자원을 낭비하고 비효율적**이지만, 알람 시계 방식은 **CPU 자원을 효율적으로 사용하고 시스템 성능을 최적화**하는 원칙을 따른다.
 
-
 ```c
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
@@ -292,45 +291,30 @@ CPU 자원 낭비: 스케줄러는 CPU를 할당할 때마다 Ready Queue에 있
 
 스케줄러 부하: 불필요한 문맥 교환(Context Switching)이 계속 발생하여 시스템 전체에 부하를 줍니다.
 
-### Our Design: Alarm Clock(Sleep/Wakeup)
+### Our Design
 
-효율적인 방법은 스레드를 Blocked 상태로 만들어 Ready Queue에서 완전히 제외하는 것이다. 스레드는 정해진 시간이 될 때까지 CPU 경쟁에 참여하지 않다가, 시간이 되면 깨어나(unblock) 다시 Ready Queue로 돌아가야 한다.
+busy waiting의 비효율성을 개선하기 위해 Sleep/Wake up 기반의 Alarm Clock을 구현한다. 기본적으로 스레드를 `ready_list`에 넣어 반복 실행시키는 기존 방식 대신, `sleep_list`라는 별도의 리스트를 정의하여 스레드를 블록 상태로 관리한다. 이후 지정된 시간이 지나면 sleep_list에 있는 스레드들을 깨워 `ready_list`로 이동시켜 다시 스케줄링할 수 있도록 한다.
 
-이를 위한 전체적인 흐름은 다음과 같다.
+**Variables**
 
-Sleep 요청: 스레드가 `timer_sleep(n)`을 호출하면, "지금부터 n 틱 후에 깨워달라"고 요청한다.
++ `static struct list sleep_list;`: 잠들어 있는 스레드를 관리하는 리스트. `list.c`에 정의된 기본 리스트 연산을 활용해 관리한다.`wakeup_tick` 기준으로 오름차순으로 정렬하여 효율적인 삽입을 가능케 한다.
 
-깨어날 시간 기록: 스레드가 깨어나야 할 정확한 tick 값을 계산하여 어딘가에 저장한다.
++ `int64_t wakeup_tick;`: 해당 스레드가 깨어나야 하는 시스템 틱 수 저장.
+`timer_sleep()` 호출 시 현재 틱 + 지정한 대기 틱 수를 저장하도록 구현한다.
 
-대기 리스트 등록 및 Block: 스레드를 잠자는 스레드들을 관리하는 별도의 리스트(예: sleep_list)에 추가하고, `thread_block()`을 호출하여 스스로를 Blocked 상태로 만든다.
+**Functions**
 
-시간 확인 (Timer Interrupt): 매 타이머 틱마다 발생하는 `timer_interrupt` 핸들러가 sleep_list를 확인한다.
++ `timer_init()`: 타이머 초기화 시 sleep_list도 같이 초기화하도록 수정한다.
 
-Wakeup 처리: 현재 시간이 sleep_list에 있는 스레드가 깨어나기로 한 시간과 같거나 지났다면, 해당 스레드를 sleep_list에서 제거하고 `thread_unblock()`을 호출하여 Ready Queue로 옮긴다.
++ `timer_sleep(int64_t ticks)`: 호출 스레드의 `wakeup_tick`을 현재 ticks + 대기 틱 수로 계산하여 설정한다. 스레드를 `sleep_list`에 `wakeup_tick` 기준 오름차순 정렬해 삽입한다. 스레드를 블록 상태로 전환하여 CPU 사용권을 포기하도록 한다.
 
-### Our Design: Alarm Clock(Sleep/Wakeup)
++ `timer_interrupt()`: `sleep_list`에서 `wakeup_tick`이 지나서 깨어나야 될 스레드를 탐색하여, 리스트에서 제거 후 `thread_unblock()`를 호출한다. 이를 통해 해당 스레드가 `ready_list`로 이동해 다시 실행 준비 상태가 된다.
 
-효율적인 스레드 관리를 위해, `timer_sleep()` 호출을 통해 **Block** 상태로 진입한 스레드는 정해진 시간이 될 때까지 CPU 경쟁에 참여하지 않고 **Ready Queue**에서 완전히 제외되어야 한다. 이는 시스템의 불필요한 스케줄링 오버헤드를 줄여 효율성을 극대화한다. 스레드는 정해진 시간이 되면 깨어나(unblock) 다시 **Ready Queue**로 돌아가며, 이 과정을 위한 전체적인 흐름은 다음과 같다.
++ `wake_less()`: `sleep_list`의 간단한 비교 함수로 `wakeup_tick` 값에 따라 리스트 삽입 순서를 정의하기 위해 추가하였다. list_insert_ordered()에 전달되어 쓰인다.
 
-#### 1. Sleep 요청 및 깨어날 시간 기록
+### Our Implementation
 
-스레드가 `timer_sleep(n)`을 호출하여 "지금부터 n 틱(tick) 후에 깨워달라"고 요청하면, 현재 스레드(cur)는 깨어나야 할 시간(틱 값)을 계산하여 자신의 `struct thread` 내부에 있는 **`wakeup_tick`** 멤버에 저장한다. 이 시간은 현재 시스템의 틱(`timer_ticks()`)에 대기 요청 시간(`ticks`)을 더하여 계산된다. 이는 스레드가 나중에 깨어날 시점을 정확하게 판단하는 기준이 된다.
-
-```c
-cur->wakeup_tick = timer_ticks () + ticks;
-```
-
-#### 2. 대기 리스트(sleep_list) 등록 및 Block
-
-깨어날 시간이 기록된 스레드는 잠자는 스레드들을 관리하기 위해 별도로 마련된 \*\*`sleep_list`\*\*에 추가됩니다. 이 리스트는 `list_insert_ordered()` 함수와 `wakeup_tick` 값을 기준으로 스레드를 정렬하는 커스텀 비교 함수 \*\*`wake_less`\*\*를 사용하여 항상 깨어날 시간이 가장 빠른 스레드가 리스트의 맨 앞에 위치하도록 **오름차순으로 유지**됩니다. 이는 다음 단계에서 리스트를 효율적으로 순회하는 데 매우 중요합니다. 리스트에 추가된 후, 스레드는 `thread_block()`을 호출하여 스스로를 **Blocked** 상태로 전환하며, **Ready Queue**에서 제외되어 스케줄링 대상에서 벗어납니다.
-
-### 3. 시간 확인 (Timer Interrupt) 및 Wakeup 처리
-
-매 타이머 틱마다 발생하는 `timer_interrupt` 핸들러는 시스템의 현재 틱을 증가시키는 것 외에, \*\*`sleep_list`\*\*를 확인하는 중요한 역할을 수행합니다. `sleep_list`는 깨어날 시간이 임박한 스레드부터 정렬되어 있기 때문에, 핸들러는 리스트의 맨 앞부터 순차적으로 스레드의 `wakeup_tick` 값을 현재 틱과 비교합니다. 만약 `current_ticks >= thread->wakeup_tick` 이라는 조건을 만족하는 스레드가 있다면, 해당 스레드를 **`sleep_list`에서 제거**하고 `thread_unblock()`을 호출하여 다시 **Ready Queue**로 옮겨 **Ready** 상태로 만듭니다. 이 과정은 조건에 맞지 않는 첫 번째 스레드를 만날 때까지 반복되는데, 리스트가 정렬되어 있으므로 그 이후의 스레드들은 아직 깨어날 시간이 되지 않았음을 보장하여 불필요한 순회를 방지하고 효율성을 높입니다.
-
-## Our Implementation
-
-### threads/thread.h
+#### threads/thread.h
 
 ```c
 struct thread{
@@ -339,7 +323,7 @@ struct thread{
 ```
 `struct thread`에 스레드가 깨어날 시간을 저장할 멤버를 추가해야 한다.
 
-### devices/timer.c
+#### devices/timer.c
 
 1. 전역 변수 추가
 
@@ -436,6 +420,7 @@ struct thread{
 
     기존 주기적으로 호출되어 시스템 틱(tick) 을 증가시키는 것에 더해, 일정 시간이 지난 후 깨워야 할 스레드를 관리하게 한다. 
 
+
 ## 3.2. Priority Scheduling
 
 ### What PINTOS Manual says?
@@ -462,7 +447,7 @@ struct thread{
 
 이 문제에 대한 부분적인 해결책은, L이 락을 보유하고 있는 동안 H가 자신의 우선순위를 L에게 **"기부(donate)"**하고, L이 락을 해제하면(그리하여 H가 락을 획득하면) 기부를 철회하는 것이다.
 
-우선순위 기부가 필요한 모든 다양한 상황들을 고려해야 합니다. 여러 스레드가 하나의 스레드에게 우선순위를 기부하는 **다중 기부(multiple donations)** 를 반드시 처리해야 한다. 또한 **중첩된 기부(nested donation)**도 처리해야 한다. 예를 들어, H가 M이 보유한 락을 기다리고, M은 L이 보유한 락을 기다린다면, M과 L은 모두 H의 우선순위로 올라가야 한다. 
+우선순위 기부가 필요한 모든 다양한 상황들을 고려해야 한다. 여러 스레드가 하나의 스레드에게 우선순위를 기부하는 **다중 기부(multiple donations)** 를 반드시 처리해야 한다. 또한 **중첩된 기부(nested donation)**도 처리해야 한다. 예를 들어, H가 M이 보유한 락을 기다리고, M은 L이 보유한 락을 기다린다면, M과 L은 모두 H의 우선순위로 올라가야 한다. 
 
 우선순위 기부는 락을 기다리는 스레드가 자신의 높은 우선순위를 락을 보유한 낮은 우선순위의 스레드에게 일시적으로 빌려주는 것이다.
 
@@ -471,12 +456,54 @@ struct thread{
 `void thread_set_priority (int new_priority)`: 현재 스레드의 우선순위를 new_priority로 설정한다.
 만약 이 변경으로 인해 현재 스레드가 더 이상 가장 높은 우선순위가 아니게 되면, CPU를 양보(yield)한다.
 
-`int thread_get_priority (void)`: 현재 스레드의 우선순위를 반환합니다. 우선순위 기부를 받은 상태라면, 더 높은 (기부받은) 우선순위를 반환해야 합니다.
+`int thread_get_priority (void)`: 현재 스레드의 우선순위를 반환한다. 우선순위 기부를 받은 상태라면, 더 높은 (기부받은) 우선순위를 반환해야 한다.
 
 ### Our Desgin
 
-현재의 scheduling 방식은 thread의 우선순위를 고려하지 않고, FIFO 기반으로 생성 순서에 따라 Round-Robin 방식을 채택하고 있다.
-스레드의 중요도에 따라 CPU 자원을 효과적으로 배분하고, 시스템 응답성을 높이며, 다양한 운영체제 시나리오를 제대로 지원하기 위해서 우선순위 스케줄러를 구현한다.
+이번 설계의 핵심은 다음의 두 가지이다. (1) Ready 리스트를 우선순위 큐로 만들기, (2) 우선순위 기부 구현하기 이다.
+
+(1) 우선순위 큐로 만들기 위해 `ready_list`를 항상 우선순위 순으로 정렬된 상태를 유지하도록 설계했다.
+
+(2) 우선순위 스케줄링의 한 가지 문제는 **"우선순위 역전(priority inversion)"**이다. 높은, 중간, 낮은 우선순위를 가진 스레드를 각각 H, M, L이라고 가정해 보자. 만약 H가 L이 점유한 락을 기다려야 하고, M이 준비 큐에 있다면, H는 결코 CPU를 얻지 못할 것이다. 왜냐하면 낮은 우선순위의 스레드 L이 CPU 시간을 얻지 못해 락을 놓아주지 못하기 때문이다. 
+
+이 문제에 대한 부분적인 해결책은, L이 락을 보유하고 있는 동안 H가 자신의 우선순위를 L에게 **"기부(donate)"**하고, L이 락을 해제하면(그리하여 H가 락을 획득하면) 기부를 철회하는 것이다. 즉, 락을 기다리는 스레드가 자신의 높은 우선순위를 락을 보유한 낮은 우선순위의 스레드에게 일시적으로 빌려주는 우선순위 기부이다.
+
+우선순위 기부가 필요한 모든 다양한 상황들을 고려해야 한다. 여러 스레드가 하나의 스레드에게 우선순위를 기부하는 **다중 기부(multiple donations)** 를 반드시 처리해야 한다. 또한 **중첩된 기부(nested donation)**도 처리해야 한다. 예를 들어, H가 M이 보유한 락을 기다리고, M은 L이 보유한 락을 기다린다면, M과 L은 모두 H의 우선순위로 올라가야 한다. 
+
+**Variables**
+
+* `int base_priority;`: 스레드가 원래 가지고 있던 기본 우선순위로, 우선순위 기부를 받기 전의 값.
+
++ `struct lock *waiting_lock;`: 현재 스레드가 기다리고 있는 락(lock)을 가리키는 포인터.
+
++ `struct list donations;`: 이 스레드에 우선순위를 기부한 다른 스레드들의 리스트. 우선순위 기부 관리에 사용.
+
++ `struct list_elem donation_elem;`: 다른 스레드의 donations 리스트에 포함될 때 쓰이는 리스트 요소.
+
++ `struct list waiters;`: 해당 락을 기다리는 스레드들을 우선순위 순서대로 정렬해 저장하는 리스트.
+
+**Functions**
+
++ `thread_unblock(struct thread *t)`: ready_list에 들어갈 때 우선순위 순으로 정렬하기 위해, 기존 list_push_back()에서 list_insert_ordered()로 수정.
+
++ `thread_yield()`: 위와 마찬가지로 실행 중인 스레드가 CPU를 양보할 때, ready_list에 우선순위 순서대로 삽입하도록 수정.
+
++ `sema_down(), cond_wait()`: 락이나 조건 변수 대기 시 우선순위에 따라 대기 리스트에 삽입하도록 수정한다.
+
++ `cond_signal()`: 대기중인 스레드 중 가장 높은 우선순위를 가진 스레드를 깨우도록 수정한다.
+
++ `thread_recalculate_priority(struct thread *t)`: 기본 우선순위와 기부받은 우선순위 중 최고값을 선택해 스레드 우선순위를 갱신.
+
++ `thread_donate_priority(struct thread *holder)`: 높은 우선순위 스레드가 락 대기 시 낮은 우선순위 락 소유자에게 우선순위 기부를 수행, 기부는 락 대기 중인 여러 스레드에 걸쳐 연쇄적으로 전파되도록 한다.
+
++ `lock_acquire(struct lock *lock)`: 락 점유 중일 경우 현재 스레드는 `waiting_lock`에 락을 기록하고, 락 소유자에 우선순위 기부 수행 후 대기하도록 구현한다.
+
++ `thread_remove_donations_for_lock(struct lock *lock)`:
+락이 해제되면 관련된 우선순위 기부 기록을 삭제하도록 한다.
+
++ `lock_release(struct lock *lock)`: 락 해제 및 기부 목록 정리, 우선순위 재계산 후 가장 높은 우선순위 스레드를 깨운다.
+
++ `test_max_priority()`: `ready_list` 맨 앞의 가장 높은 우선순위 스레드가 현재 실행 스레드보다 우선순위가 높으면, CPU를 양보하도록 한다.
 
 ### Our Implementation
 
@@ -581,6 +608,22 @@ sema_down (struct semaphore *sema)
 ---
 
 ```c
+void
+cond_signal (struct condition *cond, struct lock *lock UNUSED) 
+{
+  ASSERT (cond != NULL);
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (lock_held_by_current_thread (lock));
+
+  if (!list_empty (&cond->waiters)) {
+    list_sort(&cond->waiters,(list_less_func *) &conditional_var_comparator,NULL);
+
+    sema_up (&list_entry (list_pop_front (&cond->waiters),
+                          struct semaphore_elem, elem)->semaphore);
+  }
+}
+
 bool
 priority_less (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
 {
@@ -648,7 +691,6 @@ thread_create (const char *name, int priority, thread_func *function, void *aux)
 ```
 
 ---
-
 
 ```c
 void
@@ -821,6 +863,41 @@ load_avg: 시스템 전체가 얼마나 바쁜지를 나타내는 값. 현재 �
 이 변수들을 이용해 스레드의 priority를 주기적으로 재계산하게 된다.
 
 *고정 소수점 연산 (Fixed-Point Arithmetic)*: Pintos 커널에서는 부동 소수점(floating point) 연산을 사용할 수 없다. 하지만 위의 세 가지 변수들을 계산하는 공식에는 소수 연산이 필요하다. 이 문제를 해결하기 위해 고정 소수점(Fixed-Point) 방식을 직접 구현해야 한다. 이 연산을 쉽게 하기 위해, threads/fixed-point.h 라는 새 헤더 파일을 만들고 매크로를 쓰는 것이 편하다
+
+### Our Design
+
+이번 MLFQS 스케줄러 구현에서 핵심은 아래의 세 가지이다.
+
+1. Pintos에서는 부동소수점 연산 지원이 없으므로, PINTOS Manual을 참고하여 고정 소수점(fixed-point) 매크로 연산 파일을 만들어 효율적인 동적 우선순위 조절과 CPU 사용 시간 계산을 구현한다.
+
+2. `nice`, `recent_cpu`, `load_avg`라는 세 변수 기반으로 스레드 우선순위를 동적으로 관리한다.
+
+3. 우선순위 기부(donation) 관련 로직은 MLFQS 모드에서 비활성화하여 충돌을 방지한다.
+
+**Variables**
+
+`int nice;`: thread가 다른 thread에게 CPU를 yield하는 정도를 나타내는 정수.
+
+`int recent_cpu;`: 해당 스레드가 최근에 점유한 CPU 시간의 고정 소수점 값
+
+`static int load_avg;`: 지난 1분 동안 ready state에 있는 thread의 평균 수.
+
+고정 소수점 연산 매크로 및 상수 F = 1 << 14 정의 (fixed-point.h)
+
+**Functions**
+
+`thread_tick()`: 핀토스 메뉴얼의 Reference Guide B.4.4BSD Scheduler를 참고하여, mlfqs 플래그 활성화시 '현재 스레드 recent_cpu 1 증가 / 매 4틱마다 모든 스레드의 우선순위 재계산 / 매 1초(틱 수 기준)마다 load_avg 및 모든 스레드 recent_cpu 재계산' 이 포함되도록 구현한다.
+
+`mlfqs_recalculate_priority()`: 우선순위 계산 공식에 따라 priority 업데이트한다.
+
+`mlfqs_recalculate_recent_cpu()`: recent_cpu를 load_avg와 nice를 이용해 갱신하도록 한다.
+
+`mlfqs_recalculate_load_avg()`: load_avg를 현재 실행 가능한 스레드 수 기반으로 갱신한다.
+
+`thread_set_nice(), thread_get_nice(), thread_get_priority(), thread_get_recent_cpu(), thread_get_load_avg()`: MLFQS 인터페이스 함수로, 고정 소수점 값을 적절히 변환해서 반환 및 설정한다.
+
+lock_acquire() 및 lock_release() 변형: 
+thread_mlfqs 플래그 활성 시 우선순위 기부를 사용하지 않고 간단하게 세마포어만 사용하도록 구현한다.
 
 ### Our Implementation
 
