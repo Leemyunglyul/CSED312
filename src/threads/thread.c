@@ -409,7 +409,6 @@ thread_set_nice (int nice)
 int
 thread_get_nice (void) 
 {
-  /* Not yet implemented. */
   return thread_current()->nice;
 }
 
@@ -417,7 +416,6 @@ thread_get_nice (void)
 int
 thread_get_load_avg (void) 
 {
-  /* Not yet implemented. */
   return FP_TO_INT_NEAREST(FP_MUL_INT(load_avg, 100));
 }
 
@@ -425,7 +423,6 @@ thread_get_load_avg (void)
 int
 thread_get_recent_cpu (void) 
 {
-  /* Not yet implemented. */
   return FP_TO_INT_NEAREST(FP_MUL_INT(thread_current()->recent_cpu, 100));
 }
 
@@ -664,10 +661,8 @@ thread_donate_priority (struct thread *holder)
   
   struct thread *donor = thread_current();
   
-  // donation_elem을 사용하여 holder의 donations 리스트에 추가
   list_push_back(&holder->donations, &donor->donation_elem);
   
-  // 연쇄 기부
   while(holder) {
     thread_recalculate_priority(holder);
     if (holder->waiting_lock) {
@@ -717,20 +712,6 @@ thread_recalculate_priority (struct thread *t)
 }
 
 static void
-mlfqs_increment_recent_cpu (void)
-{
-  ASSERT (thread_mlfqs);
-  ASSERT (intr_context ());
-
-  struct thread *cur = thread_current ();
-  if (cur != idle_thread)
-    {
-      cur->recent_cpu = FP_ADD_INT (cur->recent_cpu, 1);
-    }
-}
-
-/* MLFQS: 모든 스레드의 priority를 재계산합니다. */
-static void
 mlfqs_recalculate_priority (struct thread *t, void *aux UNUSED)
 {
   if (t != idle_thread)
@@ -748,7 +729,6 @@ mlfqs_recalculate_priority (struct thread *t, void *aux UNUSED)
   }
 }
 
-/* MLFQS: 모든 스레드의 recent_cpu를 재계산합니다. */
 static void
 mlfqs_recalculate_recent_cpu (struct thread *t, void *aux UNUSED)
 {
@@ -761,7 +741,6 @@ mlfqs_recalculate_recent_cpu (struct thread *t, void *aux UNUSED)
     }
 }
 
-/* MLFQS: 시스템 load_avg를 재계산합니다. */
 static void
 mlfqs_recalculate_load_avg (void)
 {

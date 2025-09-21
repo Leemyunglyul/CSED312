@@ -308,6 +308,26 @@ Sleep 요청: 스레드가 `timer_sleep(n)`을 호출하면, "지금부터 n 틱
 
 Wakeup 처리: 현재 시간이 sleep_list에 있는 스레드가 깨어나기로 한 시간과 같거나 지났다면, 해당 스레드를 sleep_list에서 제거하고 `thread_unblock()`을 호출하여 Ready Queue로 옮긴다.
 
+### Our Design: Alarm Clock(Sleep/Wakeup)
+
+효율적인 스레드 관리를 위해, `timer_sleep()` 호출을 통해 **Block** 상태로 진입한 스레드는 정해진 시간이 될 때까지 CPU 경쟁에 참여하지 않고 **Ready Queue**에서 완전히 제외되어야 한다. 이는 시스템의 불필요한 스케줄링 오버헤드를 줄여 효율성을 극대화한다. 스레드는 정해진 시간이 되면 깨어나(unblock) 다시 **Ready Queue**로 돌아가며, 이 과정을 위한 전체적인 흐름은 다음과 같다.
+
+#### 1. Sleep 요청 및 깨어날 시간 기록
+
+스레드가 `timer_sleep(n)`을 호출하여 "지금부터 n 틱(tick) 후에 깨워달라"고 요청하면, 현재 스레드(cur)는 깨어나야 할 시간(틱 값)을 계산하여 자신의 `struct thread` 내부에 있는 **`wakeup_tick`** 멤버에 저장한다. 이 시간은 현재 시스템의 틱(`timer_ticks()`)에 대기 요청 시간(`ticks`)을 더하여 계산된다. 이는 스레드가 나중에 깨어날 시점을 정확하게 판단하는 기준이 된다.
+
+```c
+cur->wakeup_tick = timer_ticks () + ticks;
+```
+
+#### 2. 대기 리스트(sleep_list) 등록 및 Block
+
+깨어날 시간이 기록된 스레드는 잠자는 스레드들을 관리하기 위해 별도로 마련된 \*\*`sleep_list`\*\*에 추가됩니다. 이 리스트는 `list_insert_ordered()` 함수와 `wakeup_tick` 값을 기준으로 스레드를 정렬하는 커스텀 비교 함수 \*\*`wake_less`\*\*를 사용하여 항상 깨어날 시간이 가장 빠른 스레드가 리스트의 맨 앞에 위치하도록 **오름차순으로 유지**됩니다. 이는 다음 단계에서 리스트를 효율적으로 순회하는 데 매우 중요합니다. 리스트에 추가된 후, 스레드는 `thread_block()`을 호출하여 스스로를 **Blocked** 상태로 전환하며, **Ready Queue**에서 제외되어 스케줄링 대상에서 벗어납니다.
+
+### 3. 시간 확인 (Timer Interrupt) 및 Wakeup 처리
+
+매 타이머 틱마다 발생하는 `timer_interrupt` 핸들러는 시스템의 현재 틱을 증가시키는 것 외에, \*\*`sleep_list`\*\*를 확인하는 중요한 역할을 수행합니다. `sleep_list`는 깨어날 시간이 임박한 스레드부터 정렬되어 있기 때문에, 핸들러는 리스트의 맨 앞부터 순차적으로 스레드의 `wakeup_tick` 값을 현재 틱과 비교합니다. 만약 `current_ticks >= thread->wakeup_tick` 이라는 조건을 만족하는 스레드가 있다면, 해당 스레드를 **`sleep_list`에서 제거**하고 `thread_unblock()`을 호출하여 다시 **Ready Queue**로 옮겨 **Ready** 상태로 만듭니다. 이 과정은 조건에 맞지 않는 첫 번째 스레드를 만날 때까지 반복되는데, 리스트가 정렬되어 있으므로 그 이후의 스레드들은 아직 깨어날 시간이 되지 않았음을 보장하여 불필요한 순회를 방지하고 효율성을 높입니다.
+
 ## Our Implementation
 
 ### threads/thread.h

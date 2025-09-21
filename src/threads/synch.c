@@ -113,14 +113,6 @@ sema_up (struct semaphore *sema)
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
-  /*struct list_elem *father_element;
-  if (!list_empty (&sema->waiters)){ 
-    
-    list_sort(&sema->waiters,(list_less_func *) &priority_less,NULL);  //sort waiter list to assure that they are in descending order
-    father_element=list_pop_front(&sema->waiters);    //remove thread with highest priority
-    thread_unblock(list_entry(father_element,struct thread,elem));
-    
-  }*/
 
   if (!list_empty (&sema->waiters))
   {
@@ -131,8 +123,6 @@ sema_up (struct semaphore *sema)
   sema->value++;
   test_max_priority();
   intr_set_level (old_level);
-  //if (!intr_context())
-  //  thread_yield();
 }
 
 static void sema_test_helper (void *sema_);
@@ -268,7 +258,6 @@ lock_release (struct lock *lock)
   }
   struct thread *cur = thread_current();
   
-  /* 이 lock과 관련된 기부 관계를 제거하고 우선순위 재계산 */
   thread_remove_donations_for_lock(lock);
   thread_recalculate_priority(cur);
 
@@ -376,7 +365,6 @@ cond_signal (struct condition *cond, struct lock *lock UNUSED)
     sema_up (&list_entry (list_pop_front (&cond->waiters),
                           struct semaphore_elem, elem)->semaphore);
   }
-    
 }
 
 /* Wakes up all threads, if any, waiting on COND (protected by
