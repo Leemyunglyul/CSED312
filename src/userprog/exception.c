@@ -4,6 +4,8 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "userprog/syscall.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -147,6 +149,16 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+
+  if (!user && is_user_vaddr(fault_addr)) {
+      // 이 경우는 시스템 콜 처리 중 사용자가 잘못된 포인터를 넘겨준 경우이므로,
+      // 사용자 프로세스를 종료시킵니다.
+      force_exit(-1);
+  }
+  // 사용자 모드에서 발생한 페이지 폴트인 경우
+  if (user) {
+      force_exit(-1);
+  }
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to

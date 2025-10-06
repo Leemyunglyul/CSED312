@@ -17,9 +17,25 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+
+// 현재 프로세스의 자식 중 child_tid를 가진 프로세스를 찾는 함수
+static struct thread *find_child_process(tid_t child_tid) {
+    struct thread *cur = thread_current();
+    struct list_elem *e;
+    struct thread *child_t = NULL;
+
+    for (e = list_begin(&cur->child_list); e != list_end(&cur->child_list); e = list_next(e)) {
+        child_t = list_entry(e, struct thread, child_elem);
+        if (child_t->tid == child_tid) {
+            return child_t;
+        }
+    }
+    return NULL; // 해당 tid의 자식 프로세스를 찾지 못한 경우
+}
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -31,47 +47,106 @@ process_execute (const char *file_name)
   char *fn_copy;
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+  char program_name[16];
+  char *save_ptr;
+  strlcpy(program_name, file_name, sizeof(program_name));
+  strtok_r(program_name, " ", &save_ptr);
+
+  tid = thread_create (program_name, PRI_DEFAULT, start_process, fn_copy);
+
+  if (tid == TID_ERROR) {
+    palloc_free_page (fn_copy);
+    return TID_ERROR;
+  }
+
+  struct thread *child = get_thread(tid);
+  if (!child) {
+    return TID_ERROR;
+  }
+  
+  list_push_back(&thread_current()->child_list, &child->child_elem);
+  
+  sema_down(&child->load_sema);
+
+  if (!child->load_success) {
+    return TID_ERROR;
+  }
+
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
+/* userprog/process.c의 start_process 함수 - 최종 수정안 */
+/* userprog/process.c의 start_process 함수 - 최종 권장안 */
 static void
 start_process (void *file_name_)
 {
   char *file_name = file_name_;
   struct intr_frame if_;
   bool success;
+  
+  char *argv[128];
+  int argc = 0;
+  char *token, *save_ptr;
+  for (token = strtok_r(file_name, " ", &save_ptr); token != NULL;
+       token = strtok_r(NULL, " ", &save_ptr))
+  {
+      argv[argc++] = token;
+  }
 
-  /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
 
-  /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  success = load (argv[0], &if_.eip, &if_.esp);
+  
+  struct thread *cur = thread_current();
+  cur->load_success = success;
+  cur->parent = get_thread(cur->parent_tid); // 부모 포인터 설정
 
-  /* Start the user process by simulating a return from an
-     interrupt, implemented by intr_exit (in
-     threads/intr-stubs.S).  Because intr_exit takes all of its
-     arguments on the stack in the form of a `struct intr_frame',
-     we just point the stack pointer (%esp) to our stack frame
-     and jump to it. */
+  sema_up(&cur->load_sema);
+  
+  if (success) {
+    char *arg_addrs[argc];
+    int i;
+
+    for (i = argc - 1; i >= 0; i--) {
+        int len = strlen(argv[i]) + 1;
+        if_.esp -= len;
+        memcpy(if_.esp, argv[i], len);
+        arg_addrs[i] = if_.esp;
+    }
+    while ((int)if_.esp % 4 != 0) {
+        if_.esp--;
+        *(uint8_t *)if_.esp = 0;
+    }
+    if_.esp -= 4;
+    *(char **)if_.esp = NULL;
+    for (i = argc - 1; i >= 0; i--) {
+        if_.esp -= 4;
+        *(char **)if_.esp = arg_addrs[i];
+    }
+    if_.esp -= 4;
+    *(char ***)if_.esp = if_.esp + 4;
+    if_.esp -= 4;
+    *(int *)if_.esp = argc;
+    if_.esp -= 4;
+    *(int *)if_.esp = 0;
+  }
+  
+  palloc_free_page (file_name_);
+  
+  if (!success) {
+    force_exit(-1);
+  }
+
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
@@ -86,10 +161,25 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+  struct thread *child = find_child_process(child_tid);
+  if (!child) {
+      return -1; 
+  }
+  
+  list_remove(&child->child_elem);
+
+  sema_down(&child->wait_sema);
+
+  int status = child->exit_status;
+  list_remove(&child->child_elem);
+  
+  sema_up(&child->free_sema);
+
+  return status;
 }
+
 
 /* Free the current process's resources. */
 void
@@ -98,18 +188,23 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  /* Destroy the current process's page directory and switch back
-     to the kernel-only page directory. */
+  struct list_elem *e;
+  for (e = list_begin (&cur->child_list); e != list_end (&cur->child_list); e = list_next (e))
+  {
+      struct thread *child = list_entry (e, struct thread, child_elem);
+      // 부모가 사라졌으므로, 자식이 종료 대기 중이라면 풀어줍니다.
+      sema_up(&child->free_sema);
+  }
+
+  for (int i = 2; i < FDT_SIZE; i++) {
+      if (cur->fd_table[i] != NULL) {
+          file_close(cur->fd_table[i]);
+      }
+  }
+
   pd = cur->pagedir;
   if (pd != NULL) 
     {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
@@ -215,6 +310,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
   bool success = false;
   int i;
 
+  struct file *old_executable = t->executable_file;
+
+
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -228,6 +326,10 @@ load (const char *file_name, void (**eip) (void), void **esp)
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+
+  file_deny_write(file);
+  t->executable_file = file;
+
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -310,9 +412,16 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
   success = true;
 
+  if (success && old_executable != NULL) {
+    file_close(old_executable);
+  }
+
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  if (!success && file != NULL) {
+    file_close(file);
+    t->executable_file = NULL; // 실패했으므로 초기화
+  }
   return success;
 }
 
