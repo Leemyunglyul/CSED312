@@ -168,7 +168,6 @@ process_wait (tid_t child_tid)
       return -1; 
   }
   
-  list_remove(&child->child_elem);
 
   sema_down(&child->wait_sema);
 
