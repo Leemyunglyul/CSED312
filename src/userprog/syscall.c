@@ -81,6 +81,7 @@ syscall_handler (struct intr_frame *f)
   validate_address(f->esp);
 
   int syscall_number = *(int *)f->esp;
+  struct thread *cur = thread_current();
 
   switch (syscall_number) {
     case SYS_HALT:
@@ -90,6 +91,10 @@ syscall_handler (struct intr_frame *f)
     case SYS_EXIT:
       validate_address(f->esp + 4);
       int status = *(int *)(f->esp + 4);
+      //struct thread *cur = thread_current();
+      if (cur->executable_file != NULL) {
+          file_allow_write(cur->executable_file);
+      }
       force_exit(status); 
       break;
 
@@ -212,32 +217,17 @@ syscall_handler (struct intr_frame *f)
         } else if (fd_write < 2 || fd_write >= FDT_SIZE) { // 잘못된 fd
             f->eax = -1;
         } else {
-            struct thread *cur = thread_current();
-            struct file *file_to_write = cur->fd_table[fd_write];
-            if (file_to_write == NULL) { // 닫혔거나 없는 fd
-                f->eax = -1;
-            } else {
-                // ROX 테스트: 쓰려는 파일이 실행 중인 파일인지 확인
-                struct open_check_helper_inode aux;
-                aux.inode = file_get_inode(file_to_write);
-                aux.is_executable = false;
-
-                // 모든 스레드를 순회하며 아이노드 비교
-                enum intr_level old_level = intr_disable();
-                thread_foreach(check_if_inode_is_executable, &aux);
-                intr_set_level(old_level);
-                
-                if (aux.is_executable) {
-                    // 실행 중인 파일이면 쓰기 거부 (0 byte 썼다고 리턴)
-                    f->eax = 0;
-                } else {
-                    // 일반 파일이면 쓰기 진행
-                    lock_acquire(&filesys_lock);
-                    f->eax = file_write(file_to_write, buffer_write, size_write);
-                    lock_release(&filesys_lock);
-                }
-            }
-        }
+          struct thread *cur = thread_current();
+          struct file *file_to_write = cur->fd_table[fd_write];
+          if (file_to_write == NULL) { // 닫혔거나 없는 fd
+              f->eax = -1;
+          } else {
+              // file_write가 알아서 deny_write_cnt를 확인합니다.
+              lock_acquire(&filesys_lock);
+              f->eax = file_write(file_to_write, buffer_write, size_write);
+              lock_release(&filesys_lock);
+          }
+      }
         break;
 
     case SYS_SEEK:
@@ -278,7 +268,7 @@ syscall_handler (struct intr_frame *f)
       if (fd_close < 2 || fd_close >= FDT_SIZE) {
           force_exit(-1);
       }
-      struct thread *cur = thread_current();
+      //struct thread *cur = thread_current();
       if (cur->fd_table[fd_close] == NULL) {
           force_exit(-1);
       }

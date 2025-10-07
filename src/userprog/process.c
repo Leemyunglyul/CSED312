@@ -187,17 +187,25 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  struct list_elem *e;
-  for (e = list_begin (&cur->child_list); e != list_end (&cur->child_list); e = list_next (e))
-  {
-      struct thread *child = list_entry (e, struct thread, child_elem);
-      // 부모가 사라졌으므로, 자식이 종료 대기 중이라면 풀어줍니다.
-      sema_up(&child->free_sema);
+  if (cur->executable_file != NULL) {
+      file_close(cur->executable_file);
+      cur->executable_file = NULL; // 포인터를 NULL로 초기화하여 중복 close 방지
   }
 
   for (int i = 2; i < FDT_SIZE; i++) {
       if (cur->fd_table[i] != NULL) {
           file_close(cur->fd_table[i]);
+          cur->fd_table[i] = NULL;
+      }
+  }
+
+  struct list_elem *e;
+  while (!list_empty(&cur->child_list))
+  {
+      e = list_pop_front(&cur->child_list);
+      struct thread *child = list_entry (e, struct thread, child_elem);
+      if (child) {
+          sema_up(&child->free_sema);
       }
   }
 
