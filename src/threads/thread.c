@@ -288,12 +288,6 @@ thread_exit (void)
   process_exit ();
 #endif
 
-  struct thread *cur = thread_current();
-  if (cur->executable_file) {
-      file_allow_write(cur->executable_file);
-      file_close(cur->executable_file);
-  }
-
   intr_disable ();
   list_remove (&thread_current()->allelem);
   thread_current ()->status = THREAD_DYING;
