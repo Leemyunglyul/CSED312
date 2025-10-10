@@ -11,4 +11,5 @@ PINTOS 2(project2-skel branch): 80/80 ALL PASSED 🎉
 - Argument Passing
 - System Calls
 - Denying Writes to Executables
+
 **Based on Skeleton code, not PINTOS 1.**
