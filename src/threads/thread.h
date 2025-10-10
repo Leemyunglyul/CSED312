@@ -98,25 +98,23 @@ struct thread
 
     int exit_status;
 
-    /* +++ Project 2: Process Hierarchy and Synchronization +++ */
-    struct thread *parent;              // 부모 프로세스를 가리키는 포인터
+    struct thread *parent; 
     tid_t parent_tid;
-    struct list child_list;             // 자식 프로세스들을 담을 리스트
-    struct list_elem child_elem;        // 부모의 child_list에 연결될 엘리먼트
+    struct list child_list; 
+    struct list_elem child_elem;
 
     bool load_success;  
 
-    struct semaphore wait_sema;         // wait()을 위한 세마포어
-    struct semaphore load_sema;      // exec()을 위한 세마포어 (미리 추가해두면 좋음)
+    struct semaphore wait_sema; 
+    struct semaphore load_sema;
     struct semaphore free_sema;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
 
-    /* +++ 파일 디스크립터 테이블 추가 +++ */
-   struct file *fd_table[FDT_SIZE];    // 파일 객체 포인터 배열
-    int next_fd;              // 할당할 다음 fd 번호
+    struct file *fd_table[FDT_SIZE];  
+    int next_fd;          
     struct file *executable_file;
 #endif
 

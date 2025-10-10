@@ -2,6 +2,52 @@
 
 Team12 한라봉 / 컴퓨터공학과 20210807 이세광 컴퓨터공학과 20210750 이명률
 
+## 0. Prior Knowledge
+
+### Vitual Memory Layout
+
+핀토스의 가상 메모리(4GB)는 두 영역으로 나뉜다.
+
+|영역         |  주소 범위                               |  특징                    |
+|-----------------|-----------------------------------------|---------------------------------------|
+|유저 가상 메모리  |  0부터 PHYS_BASE (3GB, 0xc0000000) 미만  |  프로세스별 독립적입니다. 프로세스가 전환될 때 페이지 디렉토리 레지스터가 바뀐다.|
+|커널 가상 메모리  |  PHYS_BASE부터 4GB까지                   |  전역적이며 모든 프로세스/쓰레드가 공유합니다. 물리 메모리와 1:1 매핑된다.  |
+
++ 접근 권한: 사용자 프로그램이 커널 영역(`PHYS_BASE` 이상)에 접근하면 페이지 폴트가 발생하며 프로세스는 종료된다.
+
++ 일반적인 메모리 배치: 유저 스택은 `PHYS_BASE` 바로 아래에서 시작하여 낮은 주소로(아래로) 자란다. 코드, 초기화된 데이터, 초기화되지 않은 데이터(BSS) 세그먼트는 낮은 주소에 배치되어 높은 주소로(위로) 자란다.
+
+```
+	
+   PHYS_BASE +----------------------------------+
+             |            user stack            |
+             |                 |                |
+             |                 |                |
+             |                 V                |
+             |          grows downward          |
+             |                                  |
+             |                                  |
+             |                                  |
+             |                                  |
+             |           grows upward           |
+             |                 ^                |
+             |                 |                |
+             |                 |                |
+             +----------------------------------+
+             | uninitialized data segment (BSS) |
+             +----------------------------------+
+             |     initialized data segment     |
+             +----------------------------------+
+             |           code segment           |
+  0x08048000 +----------------------------------+
+             |                                  |
+             |                                  |
+             |                                  |
+             |                                  |
+             |                                  |
+           0 +----------------------------------+
+```
+
 ---
 
 ## 1. Analysis of process execution procedure
@@ -57,7 +103,7 @@ pintos 명령어와 함께 주어진 작업(action)을 찾아 실행한다. 예�
     // in threads/init.c, run_task()
     process_wait (process_execute (task));
     ```
-    이 한 줄이 모든 프로세스 실행의 시작점입니다.
+    이 한 줄이 모든 프로세스 실행의 시작점이다.
 
 #### 3. 새로운 쓰레드 생성 및 프로그램 로드 준비 (`process.c`)
 
@@ -105,16 +151,20 @@ pintos 명령어와 함께 주어진 작업(action)을 찾아 실행한다. 예�
 
 #### 요약
 
-`init.c: main()` -\> `init.c: run_actions()` -\> `init.c: run_task()`
+`init.c: main()` -> `init.c: run_actions()` -> `init.c: run_task()`
+
 **-- 경계 --**
-\-\> `process.c: process_execute()` (새 쓰레드 생성)
-\-\> `(새 쓰레드)` -\> `process.c: start_process()`
-\-\> `process.c: load()` (ELF 파일 로드 및 메모리 매핑)
-\-\> `process.c: start_process()` (사용자 모드로 전환)
-**-\> [사용자 프로그램 실행]**
-**-\> [프로그램 종료]** -\> `process.c: process_exit()`
+
+-> `process.c: process_execute()` (새 쓰레드 생성)
+-> `(새 쓰레드)` -> `process.c: start_process()`
+-> `process.c: load()` (ELF 파일 로드 및 메모리 매핑)
+-> `process.c: start_process()` (사용자 모드로 전환)
+**-> [사용자 프로그램 실행]**
+**-> [프로그램 종료]** -> `process.c: process_exit()`
+
 **-- 경계 --**
-\-\> `init.c: process_wait()` 리턴 -\> `init.c: shutdown()`
+
+-> `init.c: process_wait()` 리턴 -> `init.c: shutdown()`
 
 ## 2. Analysis of system call procedure
 
@@ -130,16 +180,16 @@ pintos 명령어와 함께 주어진 작업(action)을 찾아 실행한다. 예�
 
 ```c
 #define syscall1(NUMBER, ARG0)                                              \
-        ({                                                                  \
-          int retval;                                                       \
-          asm volatile                                                      \
-            ("pushl %[arg0]; pushl %[number]; int $0x30; addl $8, %%esp" \
-                : "=a" (retval)                                             \
-                : [number] "i" (NUMBER),                                    \
-                  [arg0] "g" (ARG0)                                         \
-                : "memory");                                                \
-          retval;                                                           \
-        })
+({                                                                  \
+  int retval;                                                       \
+  asm volatile                                                      \
+    ("pushl %[arg0]; pushl %[number]; int $0x30; addl $8, %%esp" \
+        : "=a" (retval)                                             \
+        : [number] "i" (NUMBER),                                    \
+          [arg0] "g" (ARG0)                                         \
+        : "memory");                                                \
+  retval;                                                           \
+})
 ```
 
 이 매크로는 GCC 인라인 어셈블리(`asm volatile`)를 사용하여 저수준의 CPU 명령을 직접 실행한다. `int $0x30` 명령어가 가장 중요하다. **소프트웨어 인터럽트(Software Interrupt)** 0x30번을 발생시킨다. 이 명령이 실행되는 순간, CPU는 현재 실행 중인 사용자 프로그램을 **일시 중단**하고, 미리 등록된 커널의 인터럽트 핸들러로 제어권을 넘긴다. 즉, **사용자 모드에서 커널 모드로 전환**되는 결정적인 지점이다.
@@ -595,4 +645,770 @@ struct inode
 
 ## 4. Proposed Design
 
+본 보고서는 PINTOS 메뉴얼이 권장하는 구현 순서(3.2 Suggested Order of Implementation)에 따라 기능들을 기술할 예정이다.
+
+### Argument Passing
+
+#### What PINTOS manual says?
+
+핵심 목표는 현재 프로그램 이름만 받을 수 있는 `process_execute()` 함수를 확장하여, 새로운 프로세스에 명령줄 인자(argument)를 전달할 수 있도록 만드는 것이다. 예를 들어, `process_execute("ls -l")`을 호출하면, `ls` 프로그램을 실행하면서 `-l`이라는 인자를 전달해야 한다.
+
+1. 명령줄 파싱 (Parsing): `process_execute()` 함수는 이제 단순히 파일 이름 하나가 아닌, 공백으로 구분된 여러 단어를 포함하는 전체 명령줄 문자열을 인자로 받게 된다. 함수는 전달받은 문자열을 공백을 기준으로 단어 단위로 나눠야 한다. 연속된 여러 개의 공백은 하나의 공백으로 취급해야 한다. 문자열을 파싱하는 방법은 자유지만, C 라이브러리 함수인 `strtok_r()` 사용을 권장하고 있다.
+
+2. Argument 길이 제한: 전체 명령줄의 길이에 대해 "합리적인" 제한을 둘 수 있다. pintos 유틸리티가 커널에 전달하는 최대 128바이트 제한에 얽매일 필요는 없다.
+
+3. User Stack 설정: 문자열 파싱이 끝난 후, 가장 중요한 단계는 이 정보들을 새로운 프로세스의 사용자 스택에 올바른 형식으로 배치하는 것이다. 프로그램이 시작될 때 main 함수가 이 인자들을 정상적으로 읽을 수 있도록 스택을 미리 설정해주어야 한다. 아래 표는 *3.5.1 Program Startup Details*에서 기술한 `/bin/ls -l foo bar`라는 명령어를 처리하는 예시이다.
+
+| 주소| 이름 | 설명  |
+| :--- | :--- | :--- |
+| `0xbffffffc` | `argv[3]`[...] | 실제 문자열 데이터 `"bar\0"`가 저장된 공간. `argv[3]` 포인터가 이 주소를 가리킴. |
+| `0xbffffff8` | `argv[2]`[...] | 실제 문자열 데이터 `"foo\0"`가 저장된 공간. `argv[2]` 포인터가 이 주소를 가리킴. |
+| `0xbffffff5` | `argv[1]`[...] | 실제 문자열 데이터 `"-l\0"`이 저장된 공간. `argv[1]` 포인터가 이 주소를 가리킴. |
+| `0xbfffffed` | `argv[0]`[...] | 실제 문자열 데이터 `"/bin/ls\0"`가 저장된 공간. `argv[0]` 포인터가 이 주소를 가리킴. |
+| `0xbfffffec` | word-align | 스택 포인터를 4바이트 배수로 맞추기 위한 padding 바이트. 0으로 채워짐. |
+| `0xbfffffe8` | `argv[4]` | `argv` 배열의 끝을 알리는 `NULL` 포인터. |
+| `0xbfffffe4` | `argv[3]` | 3번 인자(`"bar"`)가 저장된 주소(`0xbffffffc`)를 가리키는 포인터. |
+| `0xbfffffe0` | `argv[2]` | 2번 인자(`"foo"`)가 저장된 주소(`0xbffffff8`)를 가리키는 포인터. |
+| `0xbfffffdc` | `argv[1]` | 1번 인자(`"-l"`)가 저장된 주소(`0xbffffff5`)를 가리키는 포인터. |
+| `0xbfffffd8` | `argv[0]` | 0번 인자(프로그램 이름, `"/bin/ls"`)가 저장된 주소(`0xbfffffed`)를 가리키는 포인터. |
+| `0xbfffffd4` | `argv` | `argv` 배열의 시작 주소, 즉 `argv[0]`의 주소(`0xbfffffd8`)를 가리키는 이중 포인터(`char **`). |
+| `0xbfffffd0` | `argc` | 프로그램에 전달된 인자의 총 개수(프로그램 이름 포함). 이 예제에서는 4. |
+| `0xbfffffcc` | return address | `_start` 함수가 반환되지 않지만, 스택 프레임 형식을 맞추기 위한 가짜 반환 주소. 보통은 0. |
+
+#### Implementation
+
+**`process_execute` 수정**
+
+사용자로부터 "ls -l foo"와 같은 전체 명령줄을 받아 프로세스 생성을 시작하는 진입점이다. 이전에는 단순히 file_name을 `thread_create`에 그대로 전달했으며, argument 개념이 없었다.
+
++ 명령줄 복사: `palloc_get_page(0)`와 `strlcpy()`를 사용하여 전달받은 `file_name`의 복사본 `fn_copy`를 만듭니다. `strtok_r` 함수가 원본 문자열을 수정하기 때문에, 원본을 보존하고 수정 가능한 복사본을 만들기 위함이다.
+
++ 프로그램 이름 추출: strtok_r를 이용해 복사된 명령줄에서 첫 번째 단어(실행할 프로그램 이름)만 추출합니다. 이 이름은 스레드의 이름으로 사용된다.
+
++ `thread_create` 호출 변경: 추출한 프로그램 이름을 전달한다. 파싱하지 않은 전체 명령줄의 복사본 (fn_copy)을 전달한다.
+
+이처럼 process_execute는 이제 프로그램 이름과 전체 명령줄을 분리하여, 실제 스택 구성 작업은 `start_process`가 하도록 역할을 분담한다.
+
+```c
+tid_t
+process_execute (const char *file_name) 
+{
+  char *fn_copy;
+  tid_t tid;
+
+  fn_copy = palloc_get_page (0);
+  if (fn_copy == NULL)
+    return TID_ERROR;
+  strlcpy (fn_copy, file_name, PGSIZE);
+
+  char program_name[16];
+  char *save_ptr;
+  strlcpy(program_name, file_name, sizeof(program_name));
+  strtok_r(program_name, " ", &save_ptr);
+
+  tid = thread_create (program_name, PRI_DEFAULT, start_process, fn_copy);
+
+  ...
+}
+```
+
+---
+
+**`start_process` 수정**
+
+새로 생성된 스레드에서 실행되며, 이전에는 단순히 `load()` 함수만 호출했다. 
+
++ 명령줄 파싱 (Parsing): `process_execute`로부터 전달받은 전체 명령줄(file_name_)을 `strtok_r` 함수를 사용하여 공백 기준으로 자른다.
+잘린 각 단어의 시작 주소는 argv 문자열 포인터 배열에 순서대로 저장되고, 총 단어의 개수는 argc에 저장된다.
+
+  ```c
+  char *argv[128];
+  int argc = 0;
+  char *token, *save_ptr;
+  for (token = strtok_r(file_name, " ", &save_ptr); token != NULL;
+    token = strtok_r(NULL, " ", &save_ptr))
+  {
+    argv[argc++] = token;
+  }
+  ```
+
++ User Stack 구성: `load()`가 성공적으로 실행 파일을 메모리에 올린 후, '3.5.1 Program Startup Details'에 명시된 구조에 맞춰 사용자 스택을 설정한다. 스택은 높은 주소에서 낮은 주소로 쌓인다.
+
+  ```c
+  if (success) {
+    char *arg_addrs[argc];
+    int i;
+
+    // 1. 실제 인자 문자열 저장 (argv[argc-1]부터 역순으로)
+    for (i = argc - 1; i >= 0; i--) {
+        int len = strlen(argv[i]) + 1; // 널 종료 문자 포함
+        if_.esp -= len;
+        memcpy(if_.esp, argv[i], len);
+        arg_addrs[i] = if_.esp; // 스택에 저장된 주소를 임시 저장
+    }
+    
+    // 2. Word-align 패딩 (주소를 4의 배수로 맞춤)
+    while ((int)if_.esp % 4 != 0) {
+        if_.esp--;
+        *(uint8_t *)if_.esp = 0;
+    }
+    
+    // 3. 인자 문자열의 주소 저장 (argv[argc]부터 역순으로)
+    if_.esp -= 4;
+    *(char **)if_.esp = NULL; // argv[argc] = NULL
+    for (i = argc - 1; i >= 0; i--) {
+        if_.esp -= 4;
+        *(char **)if_.esp = arg_addrs[i]; // 임시 저장했던 주소 사용
+    }
+    
+    // 4. argv 배열의 시작 주소, argc, 가짜 반환 주소 저장
+    if_.esp -= 4;
+    *(char ***)if_.esp = if_.esp + 4; // argv (바로 위 주소)
+    if_.esp -= 4;
+    *(int *)if_.esp = argc;
+    if_.esp -= 4;
+    *(int *)if_.esp = 0; // fake return address
+  }
+  ```
+
+### System Calls
+
+#### What PINTOS manual says?
+
+핵심 목표는 `userprog/syscall.c`에 **시스템 콜 핸들러**를 구현하는 것이다. 사용자 프로그램이 커널의 기능을 요청할 때, 이 핸들러가 요청을 받아 처리하게 된다. 구현 과정은 다음과 같다.
+1.  사용자 스택에서 **시스템 콜 번호**를 가져온다.
+2.  해당 시스템 콜에 필요한 **인자(argument)들**을 스택에서 가져온다.
+3.  번호에 맞는 적절한 커널 동작을 수행한다.
+
+---
+
+개별 시스템 콜을 만들기 전에, 반드시 지켜야 할 세 가지 중요한 원칙이 있다.
+
+1.  **안전한 사용자 메모리 접근 (Safe User Memory Access)**
+    * 사용자 프로그램이 전달하는 포인터(주소)는 절대로 신뢰해서는 안 됩니다.
+    * 잘못된 주소(커널 영역, 할당되지 않은 공간 등)를 접근하면 OS 전체가 멈추므로, **모든 사용자 포인터는 사용하기 전에 반드시 유효성을 검사해야 합니다**.
+    * 이 검증 로직은 다른 어떤 시스템 콜보다 **먼저 구현하고 테스트**하는 것을 강력히 권장합니다.
+
+2.  **동시성 제어 (Synchronization)**
+    * Pintos의 파일 시스템 코드는 동시에 여러 스레드가 접근하는 상황에 안전하지 않습니다(not thread-safe).
+    * 따라서 여러 프로세스가 동시에 파일 관련 시스템 콜을 호출하더라도 문제가 생기지 않도록, **파일 시스템 코드를 임계 구역(critical section)으로 다루고 락(lock) 등을 이용해 보호해야 합니다**.
+
+3.  **견고성 (Robustness)**
+    * 사용자 프로그램이 어떤 잘못된 행동을 하더라도, **운영체제는 절대로 충돌하거나, 패닉에 빠지거나, 오작동해서는 안 됩니다**. 이를 "bulletproof(방탄)"라고 표현합니다.
+    * 사용자 프로그램이 OS를 멈추게 할 수 있는 유일한 방법은 `halt` 시스템 콜을 호출하는 것뿐이어야 합니다.
+    * 잘못된 인자가 전달되면, 에러 값을 반환하거나 해당 프로세스를 종료하는 방식으로 우아하게 처리해야 합니다.
+
+---
+
+프로세스 제어 관련 system call
+
+* `halt()`: Pintos를 완전히 종료시킵니다.
+* `exit(status)`: 현재 실행 중인 사용자 프로그램을 종료하고, 종료 상태(`status`)를 커널에 반환합니다. 부모 프로세스가 `wait`으로 이 상태 값을 받을 수 있습니다.
+* `exec(cmd_line)`: `cmd_line`으로 주어진 프로그램을 인자와 함께 실행하고, 새로 만들어진 프로세스의 ID(pid)를 반환합니다. 프로그램 로드에 실패하면 -1을 반환해야 합니다. **부모 프로세스는 자식 프로세스의 실행 파일 로드 성공 여부를 알 때까지 기다려야 하며, 이를 위해 반드시 동기화(synchronization)가 필요합니다**.
+* `wait(pid)`: 자식 프로세스 `pid`가 종료될 때까지 기다린 후, 자식의 종료 상태 값을 받아 반환합니다. 이 시스템 콜은 **가장 구현이 복잡하며**, 다음과 같은 여러 예외 상황을 모두 처리해야 합니다.
+    * `pid`가 나의 직접적인 자식이 아닐 경우 즉시 -1을 반환해야 합니다.
+    * 이미 `wait`을 호출했던 `pid`에 대해 또 호출할 경우 즉시 -1을 반환해야 합니다.
+    * 부모가 기다리든 아니든, 부모보다 먼저 끝나든 나중에 끝나든, 자식 프로세스의 모든 자원은 항상 올바르게 해제되어야 합니다.
+
+---
+
+파일 조작 및 입출력 관련 system call
+
+* `create(file, initial_size)`: `initial_size` 크기의 `file`이라는 새 파일을 만듭니다. 파일을 열지는 않습니다.
+* `remove(file)`: `file`을 삭제합니다.
+* `open(file)`: `file`을 열고, 파일에 접근할 수 있는 핸들인 **파일 디스크립터(fd)**를 반환합니다. 실패 시 -1을 반환합니다.
+    * fd 0은 표준 입력(키보드), fd 1은 표준 출력(콘솔)으로 예약되어 있습니다.
+    * 각 프로세스는 독립적인 fd 테이블을 가집니다.
+* `filesize(fd)`: `fd`로 열린 파일의 크기를 바이트 단위로 반환합니다.
+* `read(fd, buffer, size)`: `fd`로 열린 파일에서 `size` 바이트만큼 읽어 `buffer`에 저장합니다. 실제 읽은 바이트 수를 반환합니다. `fd`가 0이면 키보드 입력을 받습니다.
+* `write(fd, buffer, size)`: `buffer`의 데이터를 `size` 바이트만큼 `fd`로 열린 파일에 씁니다. 실제 쓰여진 바이트 수를 반환합니다. `fd`가 1이면 콘솔에 출력하며, **여러 프로세스의 출력 내용이 섞이지 않도록 한 번의 `putbuf()` 호출로 처리해야 합니다**.
+* `seek(fd, position)`: `fd`로 열린 파일에서 다음에 읽거나 쓸 위치를 `position`으로 이동합니다.
+* `tell(fd)`: `fd`로 열린 파일의 현재 위치(다음에 읽거나 쓸 위치)를 반환합니다.
+* `close(fd)`: `fd`에 해당하는 파일을 닫습니다. 프로세스가 종료되면 열려있던 모든 파일은 자동으로 닫힙니다.
+
+#### Implementation
+
+**System Call Framework**
+
+`syscall_handler()` 내부에 switch 문을 구현하여, 스택에서 읽어온 시스템 콜 번호에 따라 처리를 분기하는 구조 구현.
+
+```c
+static void
+syscall_handler (struct intr_frame *f) 
+{
+  int syscall_number = *(int *)f->esp;
+
+  switch (syscall_number){
+    ...
+  }
+}
+```
+
+---
+
+**Safe User Memory Access**
+
+syscall.c에 `validate_address`, `validate_buffer`, `validate_string` 헬퍼 함수들을 추가. 이 함수들은 `is_user_vaddr`와 `pagedir_get_page`를 활용하여 사용자가 전달한 모든 포인터가 유효한 사용자 영역에 속하고, 실제 물리 메모리에 매핑되어 있는지 선제적으로 검사한다. 유효하지 않은 주소일 경우, force_exit(-1)를 호출하여 프로세스를 즉시 종료시킴으로써 커널을 보호한다.
+
+```c
+static void validate_address(const void *uaddr) {
+    if (uaddr == NULL || !is_user_vaddr(uaddr) || pagedir_get_page(thread_current()->pagedir, uaddr) == NULL) {
+        force_exit(-1);
+    }
+}
+```
+입력받은 포인터 `uaddr`가 유효한 사용자 주소인지 확인한다. `uaddr`가 NULL이 아닌지 / `uaddr`가 사용자 주소 영역인지 (`is_user_vaddr` 함수로 판단) / 현재 스레드의 페이지 디렉토리에서 `uaddr`에 매핑된 물리 페이지가 있는지 (`pagedir_get_page`)로 검사한다. 이 조건 중 하나라도 만족하지 않으면 강제 종료한다.
+
+```c
+static void validate_buffer(const void *uaddr, unsigned size) {
+    if (size == 0) return;
+    validate_address(uaddr);
+    validate_address((const char *)uaddr + size - 1);
+}
+```
+특정 버퍼의 시작 주소 `uaddr`부터 크기 `size`만큼의 메모리가 모두 유효한지 검사합니다.
+
+```c
+static void validate_string(const char *uaddr) {
+    for (;; uaddr++) {
+        validate_address(uaddr);
+        if (*uaddr == '\0')
+            break;
+    }
+}
+```
+널 종료 문자열('\0'로 끝나는 문자열)의 모든 문자 위치가 유효한 사용자 주소인지 검사한다.
+
+---
+
+**Synchronization**
+
+파일 시스템 코드는 스레드에 안전하지 않으므로, 임계 구역으로 다루어 동시에 여러 프로세스가 접근하지 못하도록 보호해야 한다.
+
+`syscall.c`에 정적 변수로 `static struct lock filesys_lock;`을 선언하고, `syscall_init`에서 `lock_init`으로 초기화했다.
+
+```c
+static struct lock filesys_lock;
+
+void
+syscall_init (void) 
+{
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+  lock_init(&filesys_lock);
+}
+```
+
+`create`, `remove`, `open`, `read`, `write` 등 파일 시스템에 접근하는 모든 System Call의 시작과 끝을 `lock_acquire(&filesys_lock)`와 `lock_release(&filesys_lock)`으로 감쌌다. 이를 통해 한 번에 하나의 프로세스만 파일 시스템 관련 작업을 수행할 수 있도록 보장한다.
+
+```c
+switch (syscall_number) {
+  case SYS_CREATE:
+    ...
+    validate_string(file_create);
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_create(file_create, initial_size);
+    lock_release(&filesys_lock);
+    break;
+  ...
+}
+```
+
+---
+
+**Robustness**
+
+Project 2 단계에서는 아직 Virtual Memory가 구현되지 않았다. 이 단계에서 발생하는 모든 page fault는 잠재적으로 심각한 오류이다.
+
+```c
+// userprog/exception.c
+static void
+page_fault (struct intr_frame *f) 
+{
+  ...
+
+  if (!user && is_user_vaddr(fault_addr)) {
+      force_exit(-1);
+  }
+  if (user) {
+      force_exit(-1);
+  }
+  ...  
+}
+```
+
+이 두 조건문은 page fault의 원인을 **(1) 커널이 사용자의 잘못된 주소를 쓰려다 실패한 경우와 (2) 사용자가 스스로 잘못된 주소를 쓰려다 실패한 경우** 로 나누어, 두 경우 모두 잘못을 저지른 해당 프로세스만 종료시키고 커널은 계속 안정적으로 실행되도록 보장하는 필수적인 안전장치이다.
+
+---
+
+**프로세스 제어 시스템 콜**
+
+프로세스의 생성, 대기, 종료를 관리하는 핵심 기능들.
+
+- SYS_HALT: Terminates Pintos by calling shutdown_power_off() (declared in threads/init.h).
+  ```c
+  case SYS_HALT:
+    shutdown_power_off();
+    break;
+  ```
+  메뉴얼에 맞게 `shutdown_power_off();` 호출하는 것으로 구현하였다.
+
+- SYS_EXIT: 현재 프로그램을 종료하고, 부모가 `wait` 할 경우를 대비해 `status`를 커널에 반환해야 한다.
+  ```c
+  case SYS_EXIT:
+    validate_address(f->esp + 4);
+    int status = *(int *)(f->esp + 4);
+    if (cur->executable_file != NULL) {
+      file_allow_write(cur->executable_file);
+    }
+    force_exit(status); 
+    break;
+
+  // threads/thread.h
+  struct thread{
+    int exit_status;
+  }
+  ```
+  `thread` 구조체에 `int exit_status;`를 추가했다. `SYS_EXIT` 핸들러는 `status` 값을 `thread_current()->exit_status`에 저장한 후, `force_exit`를 호출하여 안전하게 프로세스를 종료하고 부모를 깨우는 등 모든 종료 절차를 수행한다.
+  
+
+- SYS_EXEC: 자식 프로세스의 실행 파일 로드 성공 여부를 부모가 알 때까지 대기하는 동기화가 필요하다.
+  ```c
+  case SYS_EXEC:
+    validate_address(f->esp + 4);
+    const char *cmd_line = *(const char **)(f->esp + 4);
+    validate_string(cmd_line);
+    f->eax = process_execute(cmd_line);
+    break;
+  ```
+  ```c
+  // threads/thread.h
+  struct thread{
+    bool load_success;  
+    struct semaphore load_sema;
+  }
+  
+  ```
+  `thread` 구조체에 `struct semaphore load_sema;`와 `bool load_success;`를 추가했다.
+
+  ```c
+  // userprog/process.c
+  tid_t
+  process_execute (const char *file_name) 
+  {
+    ...
+
+    struct thread *child = get_thread(tid);
+    if (!child) {
+      return TID_ERROR;
+    }
+    
+    list_push_back(&thread_current()->child_list, &child->child_elem);
+    
+    sema_down(&child->load_sema);
+
+    if (!child->load_success) {
+      return TID_ERROR;
+    }
+
+    return tid;
+  }
+
+  // threads/thread.c
+  struct thread *get_thread(tid_t tid) {
+      struct list_elem *e;
+      struct thread *t;
+
+      for (e = list_begin(&all_list); e != list_end(&all_list); e = list_next(e)) {
+          t = list_entry(e, struct thread, allelem);
+          if (t->tid == tid) {
+              return t;
+          }
+      }
+      return NULL;
+  }
+  ```
+  부모는 `process_execute`에서 `sema_down(&child->load_sema)`를 호출하여 자식이 로드를 마칠 때까지 대기한다. 전체 스레드 목록을 검색하여 주어진 tid에 해당하는 `struct thread` 포인터를 찾아주는 `get_thread()` 함수도 추가하여 준다.
+
+  ```c
+  // userprog/process.c
+  static void
+  start_process (void *file_name_)
+  {
+    ...
+    success = load (argv[0], &if_.eip, &if_.esp);
+    
+    struct thread *cur = thread_current();
+    cur->load_success = success;
+    cur->parent = get_thread(cur->parent_tid); 
+
+    sema_up(&cur->load_sema);
+    
+    ...
+  }
+  ```
+  자식은 `start_process`에서 로드 결과를 `load_success`에 저장한 뒤, `sema_up(&child->load_sema)`를 호출하여 부모를 깨운다.
+
+- SYS_WAIT: 가장 복잡한 시스템 콜로, 직접적인 자식만 기다려야 하며, 자식의 종료 상태를 정확히 받아오고, 한 번만 기다리게 해야 한다.
+  ```c
+  case SYS_WAIT:
+    validate_address(f->esp + 4);
+    tid_t tid = *(tid_t *)(f->esp + 4);
+    f->eax = process_wait(tid);
+    break;
+  ```
+
+  ```c
+  // threads/thread.h
+  struct thread {
+    struct thread *parent; 
+    tid_t parent_tid;
+    struct list child_list;
+    struct list_elem child_elem;
+
+    struct semaphore wait_sema;
+    struct semaphore free_sema;
+  }
+  ```
+  `thread` 구조체에 부모-자식 관계(`struct thread *parent`, `struct list child_list`)와 대기/종료 동기화를 위한 세마포어(`wait_sema`, `free_sema`)를 추가했다.
+
+  ```c
+  int
+  process_wait (tid_t child_tid) 
+  {
+    struct thread *child = find_child_process(child_tid);
+    if (!child) {
+        return -1; 
+    }
+
+    sema_down(&child->wait_sema);
+
+    int status = child->exit_status;
+    list_remove(&child->child_elem);
+    
+    sema_up(&child->free_sema);
+
+    return status;
+  }
+
+  static struct thread *find_child_process(tid_t child_tid) {
+    struct thread *cur = thread_current();
+    struct list_elem *e;
+    struct thread *child_t = NULL;
+
+    for (e = list_begin(&cur->child_list); e != list_end(&cur->child_list); e = list_next(e)) {
+        child_t = list_entry(e, struct thread, child_elem);
+        if (child_t->tid == child_tid) {
+            return child_t;
+        }
+    }
+    return NULL;
+  }
+
+  void force_exit(int status) {
+    struct thread *cur = thread_current();
+    cur->exit_status = status;
+    printf("%s: exit(%d)\n", cur->name, status);
+
+    sema_up(&cur->wait_sema);
+    sema_down(&cur->free_sema);
+
+    thread_exit();
+  }
+  ```
+  `process_wait` 함수는 `find_child_process`를 통해 자신의 `child_list`만 탐색하여 "직접적인 자식"이라는 요구사항을 만족시킨다. 부모는 `sema_down(&child->wait_sema)`를 호출하여 자식이 종료될 때까지 대기한다.
+  
+  자식은 `exit` 호출 시 `force_exit` 함수 내에서 `sema_up(&cur->wait_sema)`를 호출하여 대기 중인 부모를 깨운다. `wait`이 성공적으로 끝나면 `list_remove(&child->child_elem)`를 통해 자식 리스트에서 해당 자식을 제거함으로써, "한 번만 기다릴 수 있다"는 요구사항을 만족시킨다.
+
+---
+
+**파일 시스템 시스템 콜**
+
+파일 입출력을 위한 기반과 각 기능을 구현한다.
+
+- File Descriptor 관리 기반:
+  ```c
+  struct thread{
+  #ifdef USERPROG
+    struct file *fd_table[FDT_SIZE];  
+    int next_fd;
+  #endif
+  }        
+  ```
+  `thread` 구조체에 `struct file *fd_table[FDT_SIZE];` 배열과 `int next_fd;`를 추가하여 프로세스별로 독립적인 파일 관리 테이블을 구현했다.
+
+- SYS_CREATE: file이라는 이름과 initial_size라는 초기 크기를 가진 새로운 파일을 생성한다.
+  ```c
+  case SYS_CREATE:
+    validate_address(f->esp + 4);
+    validate_address(f->esp + 8);
+    const char *file_create = *(const char **)(f->esp + 4);
+    unsigned initial_size = *(unsigned *)(f->esp + 8);
+    validate_string(file_create);
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_create(file_create, initial_size);
+    lock_release(&filesys_lock);
+    break;
+  ```
+  인자들의 유효성을 검사한 후, filesys_lock을 획득하여 파일 시스템 접근을 동기화한다. 그 후 `filesys_create()` 함수를 호출하여 실제 파일 생성을 수행하고 결과를 eax 레지스터에 저장하여 반환한다.
+
+- SYS_REMOVE: file이라는 이름의 파일을 삭제한다.
+  ```c
+  case SYS_REMOVE:
+    validate_address(f->esp + 4);
+    const char *file_remove = *(const char **)(f->esp + 4);
+    validate_string(file_remove);
+    lock_acquire(&filesys_lock);
+    f->eax = filesys_remove(file_remove);
+    lock_release(&filesys_lock);
+    break;
+  ```
+  SYS_REMOVE 핸들러는 filesys_lock으로 보호된 임계 구역 안에서 `filesys_remove()` 함수를 호출하여 파일을 삭제하고, 그 결과를 eax 레지스터에 담아 반환한다.
+
+- SYS_OPEN: file이라는 이름의 파일을 연다. 각 프로세스는 독립적인 fd 집합을 가진다.
+  ```C
+  case SYS_OPEN:
+    validate_address(f->esp + 4);
+    const char *file_open = *(const char **)(f->esp + 4);
+    validate_string(file_open);
+    
+    lock_acquire(&filesys_lock);
+    struct file *file_obj = filesys_open(file_open);
+    lock_release(&filesys_lock);
+
+    if (file_obj == NULL) {
+        f->eax = -1;
+    } else {
+        struct thread *cur = thread_current();
+        if (cur->next_fd < FDT_SIZE) {
+            cur->fd_table[cur->next_fd] = file_obj;
+            f->eax = cur->next_fd;
+            cur->next_fd++;
+        } else {
+            file_close(file_obj);
+            f->eax = -1;
+        }
+    }
+    break;
+  ```
+  filesys_open()으로 파일을 연 후, fd_table에서 2번부터 시작하는 비어있는 슬롯을 찾아 파일 객체 포인터를 저장하고, 해당 슬롯의 인덱스를 fd 값으로 eax 레지스터에 넣어 반환한다.
+
+- SYS_FILESIZE: fd로 열린 파일의 크기를 바이트 단위로 반환한다.
+  ```c
+  case SYS_FILESIZE:
+    validate_address(f->esp + 4);
+    int fd_size = *(int *)(f->esp + 4);
+    if (fd_size < 2 || fd_size >= FDT_SIZE) {
+        f->eax = -1;
+    } else {
+        struct thread *cur = thread_current();
+        if (cur->fd_table[fd_size] == NULL) {
+            f->eax = -1;
+        } else {
+            lock_acquire(&filesys_lock);
+            f->eax = file_length(cur->fd_table[fd_size]);
+            lock_release(&filesys_lock);
+        }
+    }
+    break;
+  ```
+  전달받은 fd가 유효한 범위(2 이상)에 있는지 확인한다. 유효하다면 fd_table[fd]를 통해 파일 객체를 얻고, `filesys_lock`으로 보호하며 `file_length()` 함수를 호출해 파일 크기를 얻어 eax 레지스터로 반환한다.
+
+- SYS_READ: fd로 열린 파일에서 size 바이트를 읽어 buffer에 저장한다. 실제 읽은 바이트 수를 반환하며, fd가 0이면 키보드로부터 입력받는다.
+  ```c
+  case SYS_READ:
+    validate_address(f->esp + 4);
+    validate_address(f->esp + 8);
+    validate_address(f->esp + 12);
+    int fd_read = *(int *)(f->esp + 4);
+    void *buffer_read = *(void **)(f->esp + 8);
+    unsigned size_read = *(unsigned *)(f->esp + 12);
+    validate_buffer(buffer_read, size_read);
+
+    if (fd_read == 0) {
+        unsigned i;
+        uint8_t *local_buffer = (uint8_t *) buffer_read;
+        for (i = 0; i < size_read; i++) {
+            local_buffer[i] = input_getc();
+        }
+        f->eax = i;
+    } else if (fd_read < 2 || fd_read >= FDT_SIZE) {
+        f->eax = -1;
+    } else {
+        struct thread *cur = thread_current();
+        if (cur->fd_table[fd_read] == NULL) {
+            f->eax = -1;
+        } else {
+            lock_acquire(&filesys_lock);
+            f->eax = file_read(cur->fd_table[fd_read], buffer_read, size_read);
+            lock_release(&filesys_lock);
+        }
+    }
+    break;
+  ```
+  fd가 0일 경우 `input_getc()`를 반복 호출하여 키보드 입력을 처리한다. 다른 fd의 경우, fd_table[fd]에서 파일 객체를 찾아 `filesys_lock` 보호 하에 `file_read()`를 호출한다. buffer의 유효성은 `validate_buffer` 함수로 철저히 검사한다.
+
+- SYS_WRITE: buffer의 데이터를 size 바이트만큼 fd 파일에 쓴다. 실제 쓰여진 바이트 수를 반환하며, fd가 1이면 콘솔에 출력한다. 콘솔 출력은 여러 프로세스의 출력이 섞이지 않도록 `putbuf()`를 이용해 한 번에 처리해야 한다.
+  ```c
+  case SYS_WRITE:
+    validate_address(f->esp + 4);
+    validate_address(f->esp + 8);
+    validate_address(f->esp + 12);
+    int fd_write = *(int *)(f->esp + 4);
+    const void *buffer_write = *(const void **)(f->esp + 8);
+    unsigned size_write = *(unsigned *)(f->esp + 12);
+    validate_buffer(buffer_write, size_write);
+
+    if (fd_write == 1) { // STDOUT
+        putbuf(buffer_write, size_write);
+        f->eax = size_write;
+    } else if (fd_write < 2 || fd_write >= FDT_SIZE) { // 잘못된 fd
+        f->eax = -1;
+    } else {
+      struct thread *cur = thread_current();
+      struct file *file_to_write = cur->fd_table[fd_write];
+      if (file_to_write == NULL) { // 닫혔거나 없는 fd
+          f->eax = -1;
+      } else {
+          // file_write가 알아서 deny_write_cnt를 확인.
+          lock_acquire(&filesys_lock);
+          f->eax = file_write(file_to_write, buffer_write, size_write);
+          lock_release(&filesys_lock);
+      }
+  }
+    break;
+  ```
+  fd가 1일 경우 `putbuf()`를 호출하여 요구사항대로 콘솔 출력을 처리한다. 다른 fd의 경우, fd_table[fd]에서 파일 객체를 찾아 filesys_lock 보호 하에 `file_write()`를 호출하고 실제 쓰여진 바이트 수를 반환한다.
+
+- SYS_SEEK: fd로 열린 파일의 다음 읽기/쓰기 위치를 파일 시작부터 position 바이트 떨어진 곳으로 변경한다.
+  ```c
+   case SYS_SEEK:
+    validate_address(f->esp + 4);
+    validate_address(f->esp + 8);
+    int fd_seek = *(int *)(f->esp + 4);
+    unsigned position = *(unsigned *)(f->esp + 8);
+    if (fd_seek >= 2 && fd_seek < FDT_SIZE) {
+        struct thread *cur = thread_current();
+        if (cur->fd_table[fd_seek] != NULL) {
+            lock_acquire(&filesys_lock);
+            file_seek(cur->fd_table[fd_seek], position);
+            lock_release(&filesys_lock);
+        }
+    }
+    break;
+  ```
+  fd_table[fd]에서 파일 객체를 찾은 후, `filesys_lock`으로 보호된 상태에서 `file_seek()` 함수를 호출하여 파일의 위치(offset)를 변경한다.
+
+- SYS_TELL:  fd로 열린 파일의 다음 읽기/쓰기 위치를 반환한다.
+  ```c
+  case SYS_TELL:
+    validate_address(f->esp + 4);
+    int fd_tell = *(int *)(f->esp + 4);
+    if (fd_tell < 2 || fd_tell >= FDT_SIZE) {
+        f->eax = -1;
+    } else {
+        struct thread *cur = thread_current();
+        if (cur->fd_table[fd_tell] == NULL) {
+            f->eax = -1;
+        } else {
+            lock_acquire(&filesys_lock);
+            f->eax = file_tell(cur->fd_table[fd_tell]);
+            lock_release(&filesys_lock);
+        }
+    }
+    break;
+  ```
+  fd_table[fd]에서 파일 객체를 찾은 후, filesys_lock 보호 하에 file_tell() 함수를 호출하여 현재 위치를 얻고, 그 값을 eax 레지스터로 반환한다.
+
+- SYS_CLOSE:  파일 디스크립터 fd를 닫는다. 프로세스가 종료될 때는 열려있는 모든 파일이 암묵적으로 닫힌다.
+  ```c
+  case SYS_CLOSE:
+    validate_address(f->esp + 4);
+    int fd_close = *(int *)(f->esp + 4);
+    if (fd_close < 2 || fd_close >= FDT_SIZE) {
+        force_exit(-1);
+    }
+    if (cur->fd_table[fd_close] == NULL) {
+        force_exit(-1);
+    }
+    lock_acquire(&filesys_lock);
+    file_close(cur->fd_table[fd_close]);
+    lock_release(&filesys_lock);
+    cur->fd_table[fd_close] = NULL;
+    break;
+  ```
+  `fd_table[fd]`에서 파일 객체를 찾아 `file_close()`를 호출한다. 그 후, 해당 fd_table 슬롯을 NULL로 설정하여 fd를 다시 사용할 수 있도록 만든다. 
+
 ### Process Termination Messages
+
+사용자 프로세스가 정상적으로 exit을 호출하든, 예외에 의해 커널에 의해 종료되든, 반드시 콘솔에 [프로세스 이름]: exit([종료 코드]) / `printf ("%s: exit(%d)\n", ...);` 형식의 종료 메시지를 출력해야 한다.
+
+```c
+void force_exit(int status) {
+    struct thread *cur = thread_current();
+    cur->exit_status = status;
+    printf("%s: exit(%d)\n", cur->name, status);
+
+    sema_up(&cur->wait_sema);
+    sema_down(&cur->free_sema);
+
+    thread_exit();
+}
+```
+현재 실행중인 쓰레드를 종료시키는 `force_exit()` 내에서 위의 요구사항을 반영하였다.
+
+### Denying Writes to Executables
+
+프로세스가 실행 중일 때, 해당 프로세스의 실행 파일 자체는 수정(write)될 수 없도록 막아야 한다. 이를 위해 Pintos가 제공하는 `file_deny_write()` 함수를 사용해야 하며, 파일에 대한 쓰기를 다시 허용하려면 `file_allow_write()`를 호출하거나 파일을 닫아야(close) 한다. 결과적으로, 이 기능을 구현하려면 프로세스의 실행 파일을 프로세스가 살아있는 동안 계속 열어 두어야 한다.
+
+프로세스의 생성(load) 시점과 종료(exit) 시점의 로직을 수정하여 구현했다.
+
+- 프로세스 생성 시 쓰기 방지
+
+  ```c
+  // userprog/process.c
+  bool
+  load (const char *file_name, void (**eip) (void), void **esp) 
+  {
+    ...
+
+    file_deny_write(file);
+    t->executable_file = file;
+
+    success = true;
+
+    ...
+
+  done:
+    /* We arrive here whether the load is successful or not. */
+    if (!success && file != NULL) {
+      file_close(file);
+      t->executable_file = NULL;
+    }
+    return success;
+  }
+  ```
+
+  `load()`에서, `filesys_open()`으로 실행 파일을 성공적으로 연 직후 `file_deny_write(file);`을 호출한다. 이를 통해 다른 프로세스가 이 파일에 쓰는 것을 즉시 차단한다. 그 후, 열린 파일의 struct file 포인터를 thread 구조체에 새로 추가한 executable_file 멤버에 저장한다.
+
+  단, 로드에 실패하고 파일이 열려 있으면 다시 닫아준다. 
+
+- 프로세스 종료 시 쓰기 허용
+  ```c
+  // userprog/process.c
+  void
+  process_exit (void)
+  {
+    struct thread *cur = thread_current ();
+    uint32_t *pd;
+
+    if (cur->executable_file != NULL) {
+        file_close(cur->executable_file);
+        cur->executable_file = NULL; 
+    }
+    ...
+  }
+  ```
+  `process_exit()` 함수에 관련 로직을 추가했다. 함수 내에서 실행 파일이 열려 있는지 확인하고 파일을 닫는다.
+
+
+### Child Process 처리..

@@ -288,6 +288,9 @@ thread_exit (void)
   process_exit ();
 #endif
 
+  /* Remove thread from all threads list, set our status to dying,
+     and schedule another process.  That process will destroy us
+     when it calls thread_schedule_tail(). */
   intr_disable ();
   list_remove (&thread_current()->allelem);
   thread_current ()->status = THREAD_DYING;
@@ -602,7 +605,6 @@ struct thread *get_thread(tid_t tid) {
     struct list_elem *e;
     struct thread *t;
 
-    // 이제 all_list에 정상적으로 접근 가능
     for (e = list_begin(&all_list); e != list_end(&all_list); e = list_next(e)) {
         t = list_entry(e, struct thread, allelem);
         if (t->tid == tid) {

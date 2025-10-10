@@ -22,7 +22,6 @@
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
-// 현재 프로세스의 자식 중 child_tid를 가진 프로세스를 찾는 함수
 static struct thread *find_child_process(tid_t child_tid) {
     struct thread *cur = thread_current();
     struct list_elem *e;
@@ -34,7 +33,7 @@ static struct thread *find_child_process(tid_t child_tid) {
             return child_t;
         }
     }
-    return NULL; // 해당 tid의 자식 프로세스를 찾지 못한 경우
+    return NULL;
 }
 
 /* Starts a new thread running a user program loaded from
@@ -61,7 +60,7 @@ process_execute (const char *file_name)
 
   if (tid == TID_ERROR) {
     palloc_free_page (fn_copy);
-    return TID_ERROR;
+    return tid;
   }
 
   struct thread *child = get_thread(tid);
@@ -82,8 +81,6 @@ process_execute (const char *file_name)
 
 /* A thread function that loads a user process and starts it
    running. */
-/* userprog/process.c의 start_process 함수 - 최종 수정안 */
-/* userprog/process.c의 start_process 함수 - 최종 권장안 */
 static void
 start_process (void *file_name_)
 {
@@ -109,7 +106,7 @@ start_process (void *file_name_)
   
   struct thread *cur = thread_current();
   cur->load_success = success;
-  cur->parent = get_thread(cur->parent_tid); // 부모 포인터 설정
+  cur->parent = get_thread(cur->parent_tid);
 
   sema_up(&cur->load_sema);
   
@@ -147,6 +144,12 @@ start_process (void *file_name_)
     force_exit(-1);
   }
 
+  /* Start the user process by simulating a return from an
+     interrupt, implemented by intr_exit (in
+     threads/intr-stubs.S).  Because intr_exit takes all of its
+     arguments on the stack in the form of a `struct intr_frame',
+     we just point the stack pointer (%esp) to our stack frame
+     and jump to it. */
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
@@ -189,7 +192,7 @@ process_exit (void)
 
   if (cur->executable_file != NULL) {
       file_close(cur->executable_file);
-      cur->executable_file = NULL; // 포인터를 NULL로 초기화하여 중복 close 방지
+      cur->executable_file = NULL; 
   }
 
   for (int i = 2; i < FDT_SIZE; i++) {
@@ -212,6 +215,13 @@ process_exit (void)
   pd = cur->pagedir;
   if (pd != NULL) 
     {
+      /* Correct ordering here is crucial.  We must set
+         cur->pagedir to NULL before switching page directories,
+         so that a timer interrupt can't switch back to the
+         process page directory.  We must activate the base page
+         directory before destroying the process's page
+         directory, or our active page directory will be one
+         that's been freed (and cleared). */
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
@@ -317,9 +327,6 @@ load (const char *file_name, void (**eip) (void), void **esp)
   bool success = false;
   int i;
 
-  struct file *old_executable = t->executable_file;
-
-
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -419,15 +426,11 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
   success = true;
 
-  if (success && old_executable != NULL) {
-    file_close(old_executable);
-  }
-
  done:
   /* We arrive here whether the load is successful or not. */
   if (!success && file != NULL) {
     file_close(file);
-    t->executable_file = NULL; // 실패했으므로 초기화
+    t->executable_file = NULL;
   }
   return success;
 }
