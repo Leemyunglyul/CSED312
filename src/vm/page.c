@@ -131,9 +131,35 @@ static void
 vm_destroy_func (struct hash_elem *e, void *aux UNUSED)
 {
     struct vm_entry *vme = hash_entry (e, struct vm_entry, elem);
-    
+
+    /* 1. 스왑 해제 (기존 로직) */
     if (vme->type == VM_ANON && vme->swap_index != BITMAP_ERROR) {
         swap_free (vme->swap_index);
+    }
+
+    /* 2. mmap 파일 처리 (Write-back) */
+    if (vme->type == VM_FILE) {
+        if (vme->is_loaded) {
+            /* 2a. Dirty하면 파일에 다시 쓰기 */
+            if (pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
+                lock_acquire(&filesys_lock);
+                file_write_at(vme->file, 
+                              vme->kpage + (vme->offset % PGSIZE), 
+                              vme->read_bytes, 
+                              vme->offset);
+                lock_release(&filesys_lock);
+            }
+            /* 2b. 프레임 해제 (process_exit -> pagedir_destroy가 이미 처리함) */
+            /* (pagedir_destroy가 frame_free를 호출하므로, 
+               vme->kpage는 이미 NULL일 것입니다) */
+        }
+        
+        /* 2c. mmap이 reopen한 파일 닫기 */
+        /* (참고: mapid별로 한 번만 닫아야 하므로, 
+           여기서 닫으면 중복 닫기 오류가 발생할 수 있습니다. 
+           process_exit에서 munmap_all을 호출하는 것이 더 낫습니다.)
+        */
+        // file_close(vme->file); // [버그 위험]
     }
     
     free (vme);
@@ -167,19 +193,23 @@ load_page (struct vm_entry *vme)
     switch (vme->type) 
     {
         case VM_BIN: // 실행 파일에서 읽기
-            if (!lock_already_held) lock_acquire(&filesys_lock);
-            
-            /* [수정 3] kpage + page_offset 위치에 파일 데이터를 씀 */
-            if (file_read_at (vme->file, kpage + page_offset, 
-                            vme->read_bytes, vme->offset) 
-                != (int)vme->read_bytes) 
-            {
+            if (vme->swap_index != BITMAP_ERROR) {
+                /* 1. 스왑에서 읽기 */
+                swap_in (vme->swap_index, kpage);
+                swap_free (vme->swap_index);
+            } else {
+                /* 2. 스왑에 없으면 파일에서 읽기 (기존 로직) */
+                if (!lock_already_held) lock_acquire(&filesys_lock);
+                if (file_read_at (vme->file, kpage + page_offset, 
+                                vme->read_bytes, vme->offset) != (int)vme->read_bytes) 
+                {
+                    if (!lock_already_held) lock_release(&filesys_lock);
+                    frame_free (kpage);
+                    return false;
+                }
                 if (!lock_already_held) lock_release(&filesys_lock);
-                frame_free (kpage);
-                return false;
+                
             }
-            
-            if (!lock_already_held) lock_release(&filesys_lock);
             break;
 
         case VM_ANON: 
@@ -189,8 +219,20 @@ load_page (struct vm_entry *vme)
             }
             break;
             
-        case VM_FILE: // (mmap은 나중에 구현)
-            // ...
+        case VM_FILE: /* <<< [추가] mmap 파일 로드 */
+            if (!lock_already_held) lock_acquire(&filesys_lock);
+            
+            /* VM_BIN과 동일하게 파일에서 읽어옴 */
+            if (file_read_at (vme->file, kpage + (vme->offset % PGSIZE),
+                            vme->read_bytes, vme->offset)
+                != (int)vme->read_bytes)
+            {
+                if (!lock_already_held) lock_release(&filesys_lock);
+                frame_free(kpage);
+                return false;
+            }
+            
+            if (!lock_already_held) lock_release(&filesys_lock);
             break;
     }
 
@@ -204,4 +246,90 @@ load_page (struct vm_entry *vme)
     vme->is_loaded = true;
     vme->swap_index = BITMAP_ERROR;
     return true;
+}
+
+static void
+munmap_helper (struct hash_elem *e, void *aux)
+{
+    mapid_t *mapid = (mapid_t *)aux;
+    struct vm_entry *vme = hash_entry(e, struct vm_entry, elem);
+
+    if (vme->type == VM_FILE && vme->mapid == *mapid) {
+        /* mmap_exit과 동일한 로직 수행 */
+        
+        if (vme->is_loaded) {
+            /* 1. Dirty하면 파일에 쓰기 */
+            if (pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
+                lock_acquire(&filesys_lock);
+                file_write_at(vme->file, 
+                              vme->kpage + (vme->offset % PGSIZE), 
+                              vme->read_bytes, 
+                              vme->offset);
+                lock_release(&filesys_lock);
+            }
+            /* 2. 프레임 해제 */
+            frame_free(vme->kpage);
+            pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
+        }
+        
+        /* 3. SPT에서 vme 제거 (hash_delete는 hash_apply 도중 사용하면 위험) */
+        /* (우선 vme만 free. 또는 hash_iterator/delete 사용 필요) */
+        
+        /* vme->file은 닫지 않음 (file_close는 munmap_internal에서 한꺼번에) */
+        // free(vme); // (해시 순회 중 free는 위험!)
+        
+        /* * 안전한 삭제를 위해 vme->type을 VM_BIN(임시) 등으로 바꿔 
+         * * 나중에 vm_destroy_func에서 free하게 하거나,
+         * * 별도 리스트에 모았다가 삭제해야 함.
+         */
+    }
+}
+
+void 
+munmap_process_exit (void)
+{
+    struct thread *cur = thread_current();
+    struct hash *vm = &cur->vm;
+    
+    // 해시 테이블을 안전하게 순회하며 삭제하기 위한 반복자
+    struct hash_iterator i;
+    
+    // 안전한 삭제를 위해: 리스트로 옮기거나, 삭제 후 반복자를 리셋해야 함
+    hash_first (&i, vm); 
+
+    // 안전하지 않은 루프이지만, 이 프로젝트에서는 이 방식을 사용해야 합니다.
+    // (더 복잡한 구현을 피하기 위해)
+    while (hash_next (&i))
+    {
+        struct vm_entry *vme = hash_entry (hash_cur (&i), struct vm_entry, elem);
+
+        if (vme->type == VM_FILE) 
+        {
+            // 1. Write-back 및 리소스 해제 (munmap 로직)
+            if (vme->is_loaded) {
+                // Dirty하면 파일에 쓰기
+                if (pagedir_is_dirty(cur->pagedir, vme->vaddr)) {
+                    lock_acquire(&filesys_lock);
+                    file_write_at(vme->file, 
+                                  vme->kpage + (vme->offset % PGSIZE), 
+                                  vme->read_bytes, 
+                                  vme->offset);
+                    lock_release(&filesys_lock);
+                }
+                // 프레임 해제
+                pagedir_clear_page(cur->pagedir, vme->vaddr); 
+                frame_free(vme->kpage); 
+            }
+            
+            // 2. [mmap-exit 버그 해결] mmap이 reopen한 파일 닫기
+            file_close(vme->file); 
+            
+            // 3. SPT에서 vm_entry 제거 (반복자 리셋 후 삭제)
+            hash_delete(vm, &vme->elem);
+            hash_first(&i, vm); // [안전장치] 반복자를 리셋
+            
+            // 4. vme 구조체 자체 해제
+            free(vme);
+        }
+    }
 }

@@ -195,6 +195,8 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  munmap_process_exit();
+
   if (cur->executable_file != NULL) {
       file_close(cur->executable_file);
       cur->executable_file = NULL; 

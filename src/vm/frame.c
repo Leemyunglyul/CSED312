@@ -7,6 +7,7 @@
 #include "vm/swap.h"
 #include "userprog/pagedir.h"
 #include "lib/kernel/bitmap.h"
+#include "threads/vaddr.h"
 
 /* 페이지 교체를 시도하는 함수 (새로 추가) */
 static void *frame_evict (enum palloc_flags flags);
@@ -144,6 +145,25 @@ frame_do_swap_out (struct vm_entry *vme)
         vme->kpage = NULL;
         return true; // 스왑 성공 (사실 안 했지만)
     }
+
+    if (vme->type == VM_FILE) {
+        /* mmap된 파일 페이지 */
+        if (is_dirty) {
+            /* 1. Dirty하면 파일에 다시 쓰기(write-back) */
+            lock_acquire(&filesys_lock);
+            file_write_at(vme->file, 
+                          vme->kpage + (vme->offset % PGSIZE), 
+                          vme->read_bytes, 
+                          vme->offset);
+            lock_release(&filesys_lock);
+        }
+        /* 2. (Dirty 여부와 상관없이) 스왑에는 쓰지 않고 프레임만 해제 */
+        vme->is_loaded = false;
+        pagedir_clear_page (vme->thread->pagedir, vme->vaddr);
+        palloc_free_page (vme->kpage);
+        vme->kpage = NULL;
+        return true; 
+    }
     
     /* * Dirty 페이지(ANON 또는 BIN)는 스왑 아웃 */
     size_t swap_index = swap_out (vme->kpage); 
@@ -154,6 +174,10 @@ frame_do_swap_out (struct vm_entry *vme)
     vme->is_loaded = false;
     vme->swap_index = swap_index;
     vme->type = VM_ANON; /* 중요: 파일에서 로드했어도, 쫓겨나면 스왑(ANON) 타입 */
+
+    if (vme->type != VM_BIN) {
+        vme->type = VM_ANON; 
+    }
     
     pagedir_clear_page (vme->thread->pagedir, vme->vaddr);
     

@@ -123,6 +123,7 @@ struct thread
     struct hash vm; /* 보조 페이지 테이블 (SPT) */
     void *user_esp;
     /* ====================== */
+    int next_mapid;
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

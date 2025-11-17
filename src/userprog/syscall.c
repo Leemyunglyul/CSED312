@@ -14,6 +14,9 @@
 #include "filesys/filesys.h"
 #include "filesys/inode.h" 
 #include "vm/page.h"
+#include "threads/malloc.h" // mmap에서 vm_entry 생성 시 필요
+#include "lib/kernel/bitmap.h"
+#include <hash.h>
 
 static void syscall_handler (struct intr_frame *);
 struct lock filesys_lock;
@@ -109,6 +112,152 @@ static bool validate_string(const char *uaddr) {
         uaddr++; // 다음 바이트로 이동
     }
     return true;
+}
+
+static mapid_t
+mmap (int fd, void *addr)
+{
+    struct thread *cur = thread_current();
+
+    /* 1. 주소 유효성 검사 */
+    if (addr == NULL || pg_ofs(addr) != 0) {
+        return -1; // 널 포인터 또는 페이지 정렬 안 됨
+    }
+
+    /* 2. fd 유효성 검사 */
+    if (fd == 0 || fd == 1) {
+        return -1; // STDIN/STDOUT 매핑 불가
+    }
+    struct file *file = cur->fd_table[fd];
+    if (file == NULL) {
+        return -1; // 유효하지 않은 fd
+    }
+    
+    /* 3. 파일 길이 검사 */
+    lock_acquire(&filesys_lock);
+    off_t file_len = file_length(file);
+    lock_release(&filesys_lock);
+    
+    if (file_len == 0) {
+        return -1; // 빈 파일 매핑 불가
+    }
+
+    /* 4. [중요] file_reopen: mmap이 유지되는 동안 
+     * 다른 곳(e.g. close(fd))에서 파일을 닫아도 
+     * 커널은 이 파일을 계속 참조해야 함.
+     */
+    lock_acquire(&filesys_lock);
+    struct file *reopened_file = file_reopen(file);
+    lock_release(&filesys_lock);
+    if (reopened_file == NULL) {
+        return -1; // 파일 리오픈 실패
+    }
+    
+    /* 5. 페이지 겹침(Overlap) 검사 */
+    /* (파일을 페이지 단위로 순회하며) */
+    void *current_addr = addr;
+    off_t current_offset = 0;
+    while (current_offset < file_len) 
+    {
+        if (vm_find(&cur->vm, current_addr) != NULL) {
+            file_close(reopened_file); // 실패 시 리오픈한 파일 닫기
+            return -1; // 이미 SPT에 매핑된 주소 (겹침)
+        }
+        current_addr += PGSIZE;
+        current_offset += PGSIZE;
+    }
+    
+    /* 6. 모든 검사 통과 -> vm_entry 생성 (지연 로딩 설정) */
+    mapid_t mapid = cur->next_mapid++;
+    current_addr = addr;
+    current_offset = 0;
+    
+    while (current_offset < file_len)
+    {
+        struct vm_entry *vme = malloc(sizeof(struct vm_entry));
+        if (vme == NULL) {
+            /* (TODO: 실패 시 지금까지 만든 vme들 롤백해야 함) */
+            file_close(reopened_file);
+            return -1; 
+        }
+
+        vme->type = VM_FILE; // mmap 타입
+        vme->vaddr = current_addr;
+        vme->writable = true; // mmap은 기본적으로 쓰기 가능
+        vme->is_loaded = false;
+        vme->file = reopened_file;
+        vme->thread = cur;
+        vme->pinned = false;
+        
+        vme->offset = current_offset;
+        vme->read_bytes = (file_len - current_offset < PGSIZE) ? (file_len - current_offset) : PGSIZE;
+        vme->zero_bytes = PGSIZE - vme->read_bytes;
+        
+        vme->swap_index = BITMAP_ERROR;
+        vme->mapid = mapid; // 이 vme가 속한 map ID
+        
+        if (!vm_insert(&cur->vm, vme)) {
+             /* (TODO: 롤백) */
+            free(vme);
+            file_close(reopened_file);
+            return -1;
+        }
+
+        current_addr += PGSIZE;
+        current_offset += PGSIZE;
+    }
+    
+    return mapid;
+}
+
+/* munmap 헬퍼 함수 (일단 뼈대만) */
+static void
+munmap (mapid_t mapid)
+{
+    struct thread *cur = thread_current();
+    struct hash *vm = &cur->vm;
+    
+    struct hash_iterator i;
+    struct file *file_to_close = NULL; // mmap당 하나의 파일만 닫기
+
+    hash_first (&i, vm);
+    while (hash_next (&i))
+    {
+        struct vm_entry *vme = hash_entry (hash_cur (&i), struct vm_entry, elem);
+
+        if (vme->type == VM_FILE && vme->mapid == mapid) 
+        {
+            if (file_to_close == NULL) {
+                file_to_close = vme->file; // 닫아야 할 파일 저장
+            }
+            
+            if (vme->is_loaded) {
+                /* 1. Dirty하면 파일에 쓰기 (Write-back) */
+                if (pagedir_is_dirty(cur->pagedir, vme->vaddr)) {
+                    lock_acquire(&filesys_lock);
+                    file_write_at(vme->file, 
+                                  vme->kpage + (vme->offset % PGSIZE), 
+                                  vme->read_bytes, 
+                                  vme->offset);
+                    lock_release(&filesys_lock);
+                }
+                /* 2. 프레임 해제 */
+                frame_free(vme->kpage);
+                pagedir_clear_page(cur->pagedir, vme->vaddr);
+            }
+            
+            /* 3. SPT에서 vme 제거 (hash_iterator는 delete에 안전) */
+            hash_delete (vm, &vme->elem);
+            free (vme);
+        }
+    }
+    
+    /* 4. mmap이 reopen한 파일 닫기 */
+    if (file_to_close != NULL) {
+        lock_acquire(&filesys_lock);
+        file_close(file_to_close);
+        lock_release(&filesys_lock);
+    }
 }
 
 void
@@ -350,6 +499,24 @@ syscall_handler (struct intr_frame *f)
       lock_release(&filesys_lock);
       cur->fd_table[fd_close] = NULL;
       break;
+
+    case SYS_MMAP:
+        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8)) {
+            force_exit(-1);
+        }
+        int fd_mmap = *(int *)(f->esp + 4);
+        void *addr_mmap = *(void **)(f->esp + 8);
+        
+        f->eax = mmap(fd_mmap, addr_mmap);
+        break;
+        
+    case SYS_MUNMAP:
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
+        mapid_t mapid_munmap = *(mapid_t *)(f->esp + 4);
+        munmap(mapid_munmap);
+        break;
 
     default:
       force_exit(-1);

@@ -476,6 +476,8 @@ init_thread (struct thread *t, const char *name, int priority)
   sema_init(&t->load_sema, 0);
   sema_init(&t->free_sema, 0);
 
+  t->next_mapid = 0;
+
   #ifdef USERPROG
     // 4KB(1024개의 포인터) 크기의 fd_table 할당
 

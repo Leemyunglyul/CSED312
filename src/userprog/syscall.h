@@ -1,7 +1,9 @@
 #ifndef USERPROG_SYSCALL_H
 #define USERPROG_SYSCALL_H
 
-#include "threads/synch.h" // [추가]
+#include "threads/synch.h"
+
+typedef int mapid_t;
 
 extern struct lock filesys_lock;
 

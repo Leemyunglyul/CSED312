@@ -3,6 +3,7 @@
 
 #include <hash.h>
 #include "filesys/file.h"
+#include "userprog/syscall.h"
 
 
 /* 페이지의 상태(위치)를 나타내는 타입 */
@@ -33,6 +34,7 @@ struct vm_entry {
     /* ============================== */
     struct thread *thread;
     bool pinned;
+    mapid_t mapid;
 };
 
 
@@ -53,5 +55,7 @@ bool vm_delete (struct hash *vm, struct vm_entry *vme);
 bool load_page (struct vm_entry *vme);
 
 bool grow_stack (void *fault_addr, void *esp);
+
+void munmap_process_exit (void);
 
 #endif /* vm/page.h */
