@@ -57,5 +57,6 @@ bool load_page (struct vm_entry *vme);
 bool grow_stack (void *fault_addr, void *esp);
 
 void munmap_process_exit (void);
+void vm_munmap_page (struct vm_entry *vme);
 
 #endif /* vm/page.h */

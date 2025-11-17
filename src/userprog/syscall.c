@@ -211,6 +211,8 @@ mmap (int fd, void *addr)
 }
 
 /* munmap 헬퍼 함수 (일단 뼈대만) */
+/* userprog/syscall.c -> munmap() */
+
 static void
 munmap (mapid_t mapid)
 {
@@ -218,7 +220,8 @@ munmap (mapid_t mapid)
     struct hash *vm = &cur->vm;
     
     struct hash_iterator i;
-    struct file *file_to_close = NULL; // mmap당 하나의 파일만 닫기
+    struct file *file_to_close = NULL; 
+    bool found = false;
 
     hash_first (&i, vm);
     while (hash_next (&i))
@@ -228,36 +231,25 @@ munmap (mapid_t mapid)
         if (vme->type == VM_FILE && vme->mapid == mapid) 
         {
             if (file_to_close == NULL) {
-                file_to_close = vme->file; // 닫아야 할 파일 저장
+                file_to_close = vme->file; 
             }
             
-            if (vme->is_loaded) {
-                /* 1. Dirty하면 파일에 쓰기 (Write-back) */
-                if (pagedir_is_dirty(cur->pagedir, vme->vaddr)) {
-                    lock_acquire(&filesys_lock);
-                    file_write_at(vme->file, 
-                                  vme->kpage + (vme->offset % PGSIZE), 
-                                  vme->read_bytes, 
-                                  vme->offset);
-                    lock_release(&filesys_lock);
-                }
-                /* 2. 프레임 해제 */
-                frame_free(vme->kpage);
-                pagedir_clear_page(cur->pagedir, vme->vaddr);
-            }
+            vm_munmap_page(vme); // Write-back 및 프레임 해제
             
-            /* 3. SPT에서 vme 제거 (hash_iterator는 delete에 안전) */
             hash_delete (vm, &vme->elem);
+            hash_first(&i, vm); // 반복자 리셋
             free (vme);
+            found = true;
         }
     }
     
-    /* 4. mmap이 reopen한 파일 닫기 */
-    if (file_to_close != NULL) {
+    // 4. mmap이 reopen한 파일 닫기
+    if (file_to_close != NULL && found) {
         lock_acquire(&filesys_lock);
         file_close(file_to_close);
         lock_release(&filesys_lock);
     }
+    // munmap은 성공/실패 코드를 반환하지 않습니다.
 }
 
 void
@@ -516,6 +508,7 @@ syscall_handler (struct intr_frame *f)
         }
         mapid_t mapid_munmap = *(mapid_t *)(f->esp + 4);
         munmap(mapid_munmap);
+        f->eax = 0; // 성공 시 0 반환
         break;
 
     default:
