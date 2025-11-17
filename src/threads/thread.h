@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/synch.h"
+#include <hash.h>
 
 #define FDT_SIZE 128
 
@@ -117,6 +118,10 @@ struct thread
     int next_fd;          
     struct file *executable_file;
 #endif
+
+   /* === VM (Project 3) === */
+    struct hash vm; /* 보조 페이지 테이블 (SPT) */
+    /* ====================== */
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */

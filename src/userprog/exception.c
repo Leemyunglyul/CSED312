@@ -6,6 +6,7 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/syscall.h"
+#include "vm/page.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -150,21 +151,51 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  if (!user && is_user_vaddr(fault_addr)) {
-      force_exit(-1);
-  }
-  if (user) {
-      force_exit(-1);
-  }
+  struct thread *cur = thread_current();
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
+  if (!user) {
+        /* * 만약 커널 모드 폴트가 '또' 발생했다면, 
+         * 우리가 validate_를 빠뜨린 커널 버그입니다.
+         * (이전 PANIC 대신 force_exit으로 우선 처리)
+         */
+        force_exit(-1);
+        return;
+    }
+
+    /* * 2. (user == true) 오직 유저 모드 폴트만 처리 
+     * (e.g. 유저 프로그램이 'mov' 명령 실행)
+     */
+    void *fault_page = pg_round_down(fault_addr);
+    struct vm_entry *vme = vm_find (&cur->vm, fault_page);
+
+    if (vme == NULL) {
+        /* 3. SPT에 없음 -> 잘못된 접근 
+         * (TODO: 스택 확장(Stack growth) 체크가 여기에 필요)
+         */
+        force_exit(-1);
+        return;
+    }
+
+    /* 4. 쓰기 금지 페이지에 쓰기 시도 */
+    if (write && !vme->writable) {
+        force_exit(-1);
+        return;
+    }
+
+    /* 5. SPT에 있음 -> 지연 로딩 (load_page 호출) */
+    if (!load_page (vme)) {
+        force_exit(-1);
+        return;
+    }
+
+    /* 6. 로드 성공. 리턴하면 CPU가 실패했던 명령 재시도 */
+    return;
+
+  /*printf ("Page fault at %p: %s error %s page in %s context.\n",
           fault_addr,
           not_present ? "not present" : "rights violation",
           write ? "writing" : "reading",
           user ? "user" : "kernel");
-  kill (f);
+  kill (f);*/
 }
 

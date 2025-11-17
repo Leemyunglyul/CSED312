@@ -146,17 +146,18 @@ pagedir_get_page (uint32_t *pd, const void *uaddr)
 void
 pagedir_clear_page (uint32_t *pd, void *upage) 
 {
+  if (pd == NULL)
+    return;
   uint32_t *pte;
 
-  ASSERT (pg_ofs (upage) == 0);
-  ASSERT (is_user_vaddr (upage));
+  //ASSERT (pg_ofs (upage) == 0);
+  //ASSERT (is_user_vaddr (upage));
 
   pte = lookup_page (pd, upage, false);
-  if (pte != NULL && (*pte & PTE_P) != 0)
-    {
-      *pte &= ~PTE_P;
-      invalidate_pagedir (pd);
-    }
+  if (pte != NULL && (*pte & PTE_P))
+  {
+    *pte = 0; // PTE를 0으로 설정하여 'not-present'로 만듦
+  }
 }
 
 /* Returns true if the PTE for virtual page VPAGE in PD is dirty,

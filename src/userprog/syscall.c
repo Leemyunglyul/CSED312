@@ -13,9 +13,10 @@
 #include "filesys/file.h"
 #include "filesys/filesys.h"
 #include "filesys/inode.h" 
+#include "vm/page.h"
 
 static void syscall_handler (struct intr_frame *);
-static struct lock filesys_lock;
+struct lock filesys_lock;
 
 
 void force_exit(int status) {
@@ -29,24 +30,75 @@ void force_exit(int status) {
     thread_exit();
 }
 
-static void validate_address(const void *uaddr) {
-    if (uaddr == NULL || !is_user_vaddr(uaddr) || pagedir_get_page(thread_current()->pagedir, uaddr) == NULL) {
-        force_exit(-1);
+/* userprog/syscall.c */
+
+/* [수정] bool을 반환하도록 변경 */
+static bool validate_address(const void *uaddr) {
+    if (uaddr == NULL || uaddr >= PHYS_BASE || !is_user_vaddr(uaddr)) {
+        return false;
     }
+
+    struct thread *cur = thread_current();
+    struct vm_entry *vme = vm_find(&cur->vm, pg_round_down(uaddr));
+    
+    if (vme == NULL) {
+        /* * (나중에 여기에 스택 확장(Stack growth) 체크가 들어갈 것입니다)
+         * * SPT에 없으면 잘못된 접근입니다.
+         */
+        return false;
+    }
+
+    if (!vme->is_loaded) {
+        if (!load_page(vme)) { // 로드 실패 (e.g., 프레임 부족)
+            return false;
+        }
+    }
+    return true; // 성공
 }
 
-static void validate_buffer(const void *uaddr, unsigned size) {
-    if (size == 0) return;
-    validate_address(uaddr);
-    validate_address((const char *)uaddr + size - 1);
+/* [수정] bool을 반환하도록 변경 */
+static bool validate_buffer(const void *uaddr, unsigned size) {
+    if (size == 0) return true;
+
+    char *ptr = (char *) pg_round_down(uaddr);
+    char *end = (char *) uaddr + size;
+
+    while (ptr < end) {
+        if (!validate_address(ptr)) return false;
+        ptr += PGSIZE;
+    }
+    
+    /* * 버퍼의 마지막 바이트도 검사합니다.
+     * * (size가 0이 아님은 위에서 확인했습니다.)
+     */
+    if (!validate_address((const char *)uaddr + size - 1)) return false;
+    
+    return true;
 }
 
-static void validate_string(const char *uaddr) {
-    for (;; uaddr++) {
-        validate_address(uaddr);
+/* [수정] bool을 반환하도록 변경 */
+static bool validate_string(const char *uaddr) {
+    if (!validate_address(uaddr)) return false; // 첫 페이지 검사
+    
+    const char *page = pg_round_down(uaddr);
+    while (true) {
+        /* * 페이지 경계를 넘어가면, 다음 페이지도 
+         * * validate (및 로드)해야 합니다.
+         */
+        if (pg_round_down(uaddr) != page) {
+            page = pg_round_down(uaddr);
+            if (!validate_address(uaddr)) return false;
+        }
+        
+        /* * validate_address()가 이 페이지를 메모리에 로드했음을
+         * * 보장하므로, *uaddr 역참조는 안전합니다.
+         */
         if (*uaddr == '\0')
             break;
+            
+        uaddr++; // 다음 바이트로 이동
     }
+    return true;
 }
 
 void
@@ -59,7 +111,9 @@ syscall_init (void)
 static void
 syscall_handler (struct intr_frame *f) 
 {
-  validate_address(f->esp);
+    if (!validate_address(f->esp)) {
+        force_exit(-1);
+    }
 
   int syscall_number = *(int *)f->esp;
   struct thread *cur = thread_current();
@@ -70,51 +124,70 @@ syscall_handler (struct intr_frame *f)
         break;
 
     case SYS_EXIT:
-        validate_address(f->esp + 4);
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
         int status = *(int *)(f->esp + 4);
         if (cur->executable_file != NULL) {
-        file_allow_write(cur->executable_file);
+            file_allow_write(cur->executable_file);
         }
         force_exit(status); 
         break;
 
     case SYS_EXEC:
-        validate_address(f->esp + 4);
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
         const char *cmd_line = *(const char **)(f->esp + 4);
-        validate_string(cmd_line);
+        if (!validate_string(cmd_line)) {
+            force_exit(-1);
+        }
         f->eax = process_execute(cmd_line);
         break;
 
     case SYS_WAIT:
-        validate_address(f->esp + 4);
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
         tid_t tid = *(tid_t *)(f->esp + 4);
         f->eax = process_wait(tid);
         break;
 
     case SYS_CREATE:
-        validate_address(f->esp + 4);
-        validate_address(f->esp + 8);
+        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8)) {
+            force_exit(-1);
+        }
         const char *file_create = *(const char **)(f->esp + 4);
         unsigned initial_size = *(unsigned *)(f->esp + 8);
-        validate_string(file_create);
+        if (!validate_string(file_create)) {
+            force_exit(-1);
+        }
         lock_acquire(&filesys_lock);
         f->eax = filesys_create(file_create, initial_size);
         lock_release(&filesys_lock);
         break;
 
     case SYS_REMOVE:
-        validate_address(f->esp + 4);
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
         const char *file_remove = *(const char **)(f->esp + 4);
-        validate_string(file_remove);
+        if (!validate_string(file_remove)) {
+            force_exit(-1);
+        }
         lock_acquire(&filesys_lock);
         f->eax = filesys_remove(file_remove);
         lock_release(&filesys_lock);
         break;
 
     case SYS_OPEN:
-        validate_address(f->esp + 4);
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
         const char *file_open = *(const char **)(f->esp + 4);
-        validate_string(file_open);
+        if (!validate_string(file_open)) {
+            force_exit(-1);
+        }
         
         lock_acquire(&filesys_lock);
         struct file *file_obj = filesys_open(file_open);
@@ -136,7 +209,9 @@ syscall_handler (struct intr_frame *f)
         break;
 
     case SYS_FILESIZE:
-        validate_address(f->esp + 4);
+        if (!validate_address(f->esp + 4)) {
+            force_exit(-1);
+        }
         int fd_size = *(int *)(f->esp + 4);
         if (fd_size < 2 || fd_size >= FDT_SIZE) {
             f->eax = -1;
@@ -153,13 +228,13 @@ syscall_handler (struct intr_frame *f)
         break;
 
     case SYS_READ:
-        validate_address(f->esp + 4);
-        validate_address(f->esp + 8);
-        validate_address(f->esp + 12);
+        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8) || !validate_address(f->esp + 12)) {
+            force_exit(-1);
+        }
         int fd_read = *(int *)(f->esp + 4);
         void *buffer_read = *(void **)(f->esp + 8);
         unsigned size_read = *(unsigned *)(f->esp + 12);
-        validate_buffer(buffer_read, size_read);
+        if (!validate_buffer(buffer_read, size_read)) force_exit(-1);
 
         if (fd_read == 0) {
             unsigned i;
@@ -183,13 +258,15 @@ syscall_handler (struct intr_frame *f)
         break;
 
     case SYS_WRITE:
-        validate_address(f->esp + 4);
-        validate_address(f->esp + 8);
-        validate_address(f->esp + 12);
+        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8) || !validate_address(f->esp + 12)) {
+            force_exit(-1);
+        }
         int fd_write = *(int *)(f->esp + 4);
         const void *buffer_write = *(const void **)(f->esp + 8);
         unsigned size_write = *(unsigned *)(f->esp + 12);
-        validate_buffer(buffer_write, size_write);
+        if (!validate_buffer(buffer_write, size_write)) {
+            force_exit(-1);
+        }
 
         if (fd_write == 1) { // STDOUT
             putbuf(buffer_write, size_write);
@@ -211,8 +288,9 @@ syscall_handler (struct intr_frame *f)
         break;
 
     case SYS_SEEK:
-      validate_address(f->esp + 4);
-      validate_address(f->esp + 8);
+      if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8)) {
+          force_exit(-1);
+      }
       int fd_seek = *(int *)(f->esp + 4);
       unsigned position = *(unsigned *)(f->esp + 8);
       if (fd_seek >= 2 && fd_seek < FDT_SIZE) {
@@ -226,7 +304,9 @@ syscall_handler (struct intr_frame *f)
       break;
 
     case SYS_TELL:
-      validate_address(f->esp + 4);
+      if (!validate_address(f->esp + 4)) {
+          force_exit(-1);
+      }
       int fd_tell = *(int *)(f->esp + 4);
       if (fd_tell < 2 || fd_tell >= FDT_SIZE) {
           f->eax = -1;
@@ -243,7 +323,9 @@ syscall_handler (struct intr_frame *f)
       break;
 
     case SYS_CLOSE:
-      validate_address(f->esp + 4);
+      if (!validate_address(f->esp + 4)) {
+          force_exit(-1);
+      }
       int fd_close = *(int *)(f->esp + 4);
       if (fd_close < 2 || fd_close >= FDT_SIZE) {
           force_exit(-1);

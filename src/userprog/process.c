@@ -19,6 +19,7 @@
 #include "threads/vaddr.h"
 #include "userprog/syscall.h"
 #include "vm/frame.h"
+#include "vm/page.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -98,6 +99,9 @@ start_process (void *file_name_)
       argv[argc++] = token;
   }
 
+  struct thread *cur = thread_current();
+  vm_init (&cur->vm);
+
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
@@ -105,7 +109,6 @@ start_process (void *file_name_)
 
   success = load (argv[0], &if_.eip, &if_.esp);
   
-  struct thread *cur = thread_current();
   cur->load_success = success;
   cur->parent = get_thread(cur->parent_tid);
 
@@ -227,6 +230,8 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+
+    vm_destroy (&cur->vm);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -389,26 +394,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
           if (validate_segment (&phdr, file)) 
             {
               bool writable = (phdr.p_flags & PF_W) != 0;
-              uint32_t file_page = phdr.p_offset & ~PGMASK;
-              uint32_t mem_page = phdr.p_vaddr & ~PGMASK;
-              uint32_t page_offset = phdr.p_vaddr & PGMASK;
-              uint32_t read_bytes, zero_bytes;
-              if (phdr.p_filesz > 0)
-                {
-                  /* Normal segment.
-                     Read initial part from disk and zero the rest. */
-                  read_bytes = page_offset + phdr.p_filesz;
-                  zero_bytes = (ROUND_UP (page_offset + phdr.p_memsz, PGSIZE)
-                                - read_bytes);
-                }
-              else 
-                {
-                  /* Entirely zero.
-                     Don't read anything from disk. */
-                  read_bytes = 0;
-                  zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
-                }
-              if (!load_segment (file, file_page, (void *) mem_page,
+              uint32_t read_bytes = phdr.p_filesz;
+              uint32_t zero_bytes = phdr.p_memsz - phdr.p_filesz;
+              if (!load_segment (file, phdr.p_offset, (void *) phdr.p_vaddr,
                                  read_bytes, zero_bytes, writable))
                 goto done;
             }
@@ -438,7 +426,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
 /* load() helpers. */
 
-static bool install_page (void *upage, void *kpage, bool writable);
+bool install_page (void *upage, void *kpage, bool writable);
 
 /* Checks whether PHDR describes a valid, loadable segment in
    FILE and returns true if so, false otherwise. */
@@ -503,45 +491,77 @@ static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
 {
-  ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
-  ASSERT (pg_ofs (upage) == 0);
-  ASSERT (ofs % PGSIZE == 0);
+  // upage는 이제 phdr.p_vaddr (예: 0x080480a0)
+  // ofs는 phdr.p_offset (예: 0x0a0)
+  // read_bytes는 phdr.p_filesz (예: 0x50)
 
-  file_seek (file, ofs);
-  while (read_bytes > 0 || zero_bytes > 0) 
-    {
-      /* Calculate how to fill this page.
-         We will read PAGE_READ_BYTES bytes from FILE
-         and zero the final PAGE_ZERO_BYTES bytes. */
-      size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
-      size_t page_zero_bytes = PGSIZE - page_read_bytes;
+  ASSERT ((read_bytes + zero_bytes) >= 0);
+  ASSERT (pg_ofs (upage) == (ofs % PGSIZE)); // vaddr과 ofs의 페이지 내 오프셋은 같음
 
-      /* Get a page of memory. */
-      uint8_t *kpage = frame_alloc (upage, PAL_USER);
-      if (kpage == NULL)
-        return false;
+  off_t current_ofs = ofs;
+  uint8_t *current_upage = upage;
+  uint32_t total_bytes_to_process = read_bytes + zero_bytes; // 처리할 총 바이트
 
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          frame_free (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+  while (total_bytes_to_process > 0) 
+  {
+      // 1. 현재 페이지 시작 오프셋과 남은 공간 계산
+      size_t page_offset = pg_ofs(current_upage); // e.g., 0xa0 (첫 루프)
+      size_t page_remaining = PGSIZE - page_offset; // e.g., 0xF60 (첫 루프)
 
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          frame_free (kpage);
-          return false; 
-        }
+      // 2. 이 페이지에 채울 파일 바이트 수 계산
+      size_t page_read_bytes = (read_bytes < page_remaining) ? read_bytes : page_remaining;
 
-      /* Advance. */
+      // 3. 이 페이지에 채울 0 바이트 수 계산
+      size_t page_zero_bytes = 0;
+      if (page_read_bytes < page_remaining) {
+          page_zero_bytes = (zero_bytes < (page_remaining - page_read_bytes))
+                          ? zero_bytes : (page_remaining - page_read_bytes);
+      }
+
+      // 4. SPT에서 이 페이지(정렬된 주소)를 찾음
+      uint8_t *page_vaddr = pg_round_down(current_upage); // e.g., 0x08048000
+      struct vm_entry *vme = vm_find(&thread_current()->vm, page_vaddr);
+
+      if (vme == NULL) {
+          vme = malloc(sizeof(struct vm_entry));
+          if (vme == NULL) return false;
+
+          vme->type = VM_BIN;
+          vme->vaddr = page_vaddr;
+          vme->writable = writable;
+          vme->is_loaded = false;
+          vme->file = file;
+
+          vme->offset = current_ofs;
+          vme->read_bytes = page_read_bytes;
+          vme->zero_bytes = page_zero_bytes;
+
+          if (!vm_insert(&thread_current()->vm, vme)) {
+              free(vme);
+              return false;
+          }
+      } else {
+          // 중복 처리: .text와 .data가 겹치는 경우
+          if (writable && !vme->writable) {
+              vme->writable = true;
+          }
+      }
+
+      // 5. 이 페이지에서 처리한 총 바이트 수
+      size_t bytes_processed_this_page = page_read_bytes + page_zero_bytes;
+
+      // 6. 남은 바이트 수 업데이트
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
-      upage += PGSIZE;
-    }
+      total_bytes_to_process -= bytes_processed_this_page;
+
+      // 7. 다음 변수 업데이트
+      current_ofs += page_read_bytes;
+      current_upage += bytes_processed_this_page;
+  }
+
   return true;
+
 }
 
 /* Create a minimal stack by mapping a zeroed page at the top of
@@ -549,22 +569,52 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack (void **esp) 
 {
-  uint8_t *kpage;
-  bool success = false;
+    bool success = false;
+    void *stack_upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
+    struct thread *cur = thread_current();
+    
+    /* [수정] vme를 먼저 찾거나 생성 (malloc 1번) */
+    struct vm_entry *vme = vm_find (&cur->vm, stack_upage);
+    if (vme == NULL) {
+        vme = malloc(sizeof(struct vm_entry));
+        if (vme == NULL) return false; // malloc 실패
 
-  //kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  void *stack_upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
-  kpage = frame_alloc (stack_upage, PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
-    {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-        *esp = PHYS_BASE;
-      else
-        //palloc_free_page (kpage);
-        frame_free (kpage);
+        vme->type = VM_ANON;
+        vme->vaddr = stack_upage;
+        vme->writable = true;
+        vme->is_loaded = true; // (이제 로드할 것임)
+        vme->file = NULL;
+        
+        if (!vm_insert (&cur->vm, vme)) {
+            free(vme);
+            return false;
+        }
+    } else {
+        vme->is_loaded = true;
+        vme->type = VM_ANON; 
+        vme->writable = true;
     }
-  return success;
+
+    /* [수정] frame_alloc에 vme 전달 */
+    uint8_t *kpage = frame_alloc (vme, PAL_USER | PAL_ZERO);
+    if (kpage == NULL) {
+        /* * 롤백: vme는 SPT에 남겨두고 'not_loaded'로 되돌림
+         * * (혹은 vm_delete 호출) 
+         */
+        vme->is_loaded = false; 
+        return false;
+    }
+    
+    success = install_page (stack_upage, kpage, true);
+    if (!success)
+    {
+        frame_free (kpage);
+        vme->is_loaded = false;
+        return false;
+    }
+    
+    *esp = PHYS_BASE;
+    return true; /* 성공 */
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -576,7 +626,7 @@ setup_stack (void **esp)
    with palloc_get_page().
    Returns true on success, false if UPAGE is already mapped or
    if memory allocation fails. */
-static bool
+bool
 install_page (void *upage, void *kpage, bool writable)
 {
   struct thread *t = thread_current ();
