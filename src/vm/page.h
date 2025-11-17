@@ -31,6 +31,7 @@ struct vm_entry {
     void *kpage;            /* 프레임 주소 (로드되었을 때만) */
     struct list_elem f_elem; /* 프레임 테이블(list)용 elem */
     /* ============================== */
+    struct thread *thread;
 };
 
 

@@ -51,6 +51,8 @@ grow_stack (void *fault_addr, void *esp)
     vme->writable = true;
     vme->is_loaded = false;
     vme->file = NULL;
+    vme->thread = thread_current();
+    vme->swap_index = 0;
 
     if (!vm_insert (&thread_current()->vm, vme)) {
         free (vme);
@@ -144,6 +146,9 @@ vm_destroy (struct hash *vm)
 bool 
 load_page (struct vm_entry *vme)
 {
+    if (vme->is_loaded) {
+        return true;
+    }
     /* 1. 물리 프레임 할당 (1단계에서 만든 frame_alloc 사용) */
     void *kpage = frame_alloc (vme, PAL_USER | PAL_ZERO);
     if (kpage == NULL) {
@@ -174,6 +179,12 @@ load_page (struct vm_entry *vme)
             break;
 
         case VM_ANON: 
+            if (vme->swap_index != 0) { // 0을 유효하지 않은 인덱스로 가정
+                swap_in (vme->swap_index, kpage);
+                swap_free (vme->swap_index); // 스왑에서 읽어왔으니 슬롯 해제
+            } else {
+                /* (기존 로직) 스택 확장 등, PAL_ZERO로 이미 0으로 채워짐 */
+            }
             break;
             
         case VM_FILE: // (mmap은 나중에 구현)
@@ -189,5 +200,6 @@ load_page (struct vm_entry *vme)
 
     /* 4. SPT 상태 업데이트 */
     vme->is_loaded = true;
+    vme->swap_index = 0;
     return true;
 }

@@ -531,10 +531,12 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
           vme->writable = writable;
           vme->is_loaded = false;
           vme->file = file;
+          vme->thread = thread_current();
 
           vme->offset = current_ofs;
           vme->read_bytes = page_read_bytes;
           vme->zero_bytes = page_zero_bytes;
+          vme->swap_index = 0;
 
           if (!vm_insert(&thread_current()->vm, vme)) {
               free(vme);
@@ -584,6 +586,8 @@ setup_stack (void **esp)
         vme->writable = true;
         vme->is_loaded = true; // (이제 로드할 것임)
         vme->file = NULL;
+        vme->thread = thread_current();
+        vme->swap_index = 0;
         
         if (!vm_insert (&cur->vm, vme)) {
             free(vme);
