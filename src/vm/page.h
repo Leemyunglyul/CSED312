@@ -50,4 +50,6 @@ bool vm_delete (struct hash *vm, struct vm_entry *vme);
 /* 페이지 폴트 시 호출될 핸들러 (데이터 로딩) */
 bool load_page (struct vm_entry *vme);
 
+bool grow_stack (void *fault_addr, void *esp);
+
 #endif /* vm/page.h */

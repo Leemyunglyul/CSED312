@@ -7,7 +7,64 @@
 #include "threads/synch.h"
 #include "userprog/syscall.h"
 
+#define STACK_MAX_SIZE (8 * 1024 * 1024)
+
 extern struct lock filesys_lock;
+
+/* vm/page.c */
+
+bool
+grow_stack (void *fault_addr, void *esp)
+{
+    /* 1. 8MB 스택 제한 확인 */
+    if (fault_addr < (PHYS_BASE - STACK_MAX_SIZE) || fault_addr >= PHYS_BASE) {
+        return false;
+    }
+
+    /* === [핵심 수정] === */
+    /* * Heuristic:
+     * 1. PUSH/PUSHA (최대 esp - 32) 허용
+     * 2. mov [esp+m] (fault_addr >= esp) 허용
+     * 3. pt-grow-stack/pt-big-stk-obj (sub %esp 후 접근, fault_addr >= esp) 허용
+     * * 따라서 fault_addr가 (esp - 32) 보다 낮으면 거부합니다.
+     */
+    if (fault_addr < (esp - 32)) {
+        /* pt-grow-bad (esp - 4097)는 여기서 거부됩니다. */
+        return false;
+    }
+    /* ================== */
+
+    /* 3. 새 스택 페이지(VM_ANON) 생성 */
+    void *stack_page = pg_round_down(fault_addr);
+    
+    /* (이미 할당된 페이지인지 한 번 더 확인) */
+    if (vm_find(&thread_current()->vm, stack_page) != NULL) {
+        return false;
+    }
+
+    /* (Turn 47의 나머지 로직과 동일) */
+    struct vm_entry *vme = malloc(sizeof(struct vm_entry));
+    if (vme == NULL) return false;
+
+    vme->type = VM_ANON;
+    vme->vaddr = stack_page;
+    vme->writable = true;
+    vme->is_loaded = false;
+    vme->file = NULL;
+
+    if (!vm_insert (&thread_current()->vm, vme)) {
+        free (vme);
+        return false;
+    }
+
+    if (!load_page (vme)) {
+        vm_delete (&thread_current()->vm, vme);
+        free (vme);
+        return false;
+    }
+
+    return true;
+}
 
 /* 가상 주소(vaddr)를 해시 값으로 변환하는 함수 */
 static unsigned

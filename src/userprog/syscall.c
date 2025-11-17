@@ -42,14 +42,21 @@ static bool validate_address(const void *uaddr) {
     struct vm_entry *vme = vm_find(&cur->vm, pg_round_down(uaddr));
     
     if (vme == NULL) {
-        /* * (나중에 여기에 스택 확장(Stack growth) 체크가 들어갈 것입니다)
-         * * SPT에 없으면 잘못된 접근입니다.
+        /* [핵심 수정] SPT에 없으면 스택 확장 시도 */
+        /* cur->user_esp는 syscall_handler가 설정 */
+        if (!grow_stack(uaddr, cur->user_esp)) {
+            return false;
+        }
+        /* * grow_stack이 vme를 생성하고 로드까지 했으므로
+         * * (혹은 vme->is_loaded = false로 설정했으므로)
+         * * vme를 다시 찾을 필요 없이, 로드만 확인하면 됩니다.
+         * * (grow_stack이 로드까지 하므로, 여기선 그냥 true 반환)
          */
-        return false;
+        return true; 
     }
 
     if (!vme->is_loaded) {
-        if (!load_page(vme)) { // 로드 실패 (e.g., 프레임 부족)
+        if (!load_page(vme)) { // 로드 실패
             return false;
         }
     }
@@ -111,12 +118,15 @@ syscall_init (void)
 static void
 syscall_handler (struct intr_frame *f) 
 {
+    struct thread *cur = thread_current();
+    cur->user_esp = f->esp; // [핵심 추가] 유저 esp 저장
+
     if (!validate_address(f->esp)) {
         force_exit(-1);
     }
 
-  int syscall_number = *(int *)f->esp;
-  struct thread *cur = thread_current();
+    int syscall_number = *(int *)(f->esp);
+
 
   switch (syscall_number) {
     case SYS_HALT:

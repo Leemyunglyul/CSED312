@@ -121,6 +121,7 @@ struct thread
 
    /* === VM (Project 3) === */
     struct hash vm; /* 보조 페이지 테이블 (SPT) */
+    void *user_esp;
     /* ====================== */
 
     /* Owned by thread.c. */

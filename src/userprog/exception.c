@@ -172,7 +172,10 @@ page_fault (struct intr_frame *f)
         /* 3. SPT에 없음 -> 잘못된 접근 
          * (TODO: 스택 확장(Stack growth) 체크가 여기에 필요)
          */
-        force_exit(-1);
+        if (!grow_stack(fault_addr, f->esp)) {
+            /* 2. 스택 확장이 아니거나 실패하면 종료 */
+            force_exit(-1);
+        }
         return;
     }
 
