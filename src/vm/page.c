@@ -6,6 +6,7 @@
 #include <string.h>
 #include "threads/synch.h"
 #include "userprog/syscall.h"
+#include "lib/kernel/bitmap.h"
 
 #define STACK_MAX_SIZE (8 * 1024 * 1024)
 
@@ -52,7 +53,8 @@ grow_stack (void *fault_addr, void *esp)
     vme->is_loaded = false;
     vme->file = NULL;
     vme->thread = thread_current();
-    vme->swap_index = 0;
+    vme->swap_index = BITMAP_ERROR; // 스왑 없음
+    vme->pinned = false;
 
     if (!vm_insert (&thread_current()->vm, vme)) {
         free (vme);
@@ -130,7 +132,9 @@ vm_destroy_func (struct hash_elem *e, void *aux UNUSED)
 {
     struct vm_entry *vme = hash_entry (e, struct vm_entry, elem);
     
-    // (나중에 스왑, mmap 해제 로직 추가 필요)
+    if (vme->type == VM_ANON && vme->swap_index != BITMAP_ERROR) {
+        swap_free (vme->swap_index);
+    }
     
     free (vme);
 }
@@ -179,11 +183,9 @@ load_page (struct vm_entry *vme)
             break;
 
         case VM_ANON: 
-            if (vme->swap_index != 0) { // 0을 유효하지 않은 인덱스로 가정
+            if (vme->swap_index != BITMAP_ERROR) { 
                 swap_in (vme->swap_index, kpage);
-                swap_free (vme->swap_index); // 스왑에서 읽어왔으니 슬롯 해제
-            } else {
-                /* (기존 로직) 스택 확장 등, PAL_ZERO로 이미 0으로 채워짐 */
+                swap_free (vme->swap_index);
             }
             break;
             
@@ -200,6 +202,6 @@ load_page (struct vm_entry *vme)
 
     /* 4. SPT 상태 업데이트 */
     vme->is_loaded = true;
-    vme->swap_index = 0;
+    vme->swap_index = BITMAP_ERROR;
     return true;
 }

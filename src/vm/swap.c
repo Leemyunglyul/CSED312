@@ -18,22 +18,19 @@ static struct lock swap_lock;
 void
 swap_init (void) 
 {
-    /* 1. 스왑 디스크 가져오기 */
     swap_disk = block_get_role (BLOCK_SWAP);
     if (swap_disk == NULL) {
-        /* PANIC을 사용하거나, 스왑 없음을 알리고 리턴할 수 있습니다. */
-        return; 
+        /* [수정] 조용히 리턴하는 대신 패닉 */
+        PANIC ("Swap disk not found, use --swap-size option."); 
     }
 
-    /* 2. 스왑 디스크 크기에 맞는 비트맵 생성 */
-    /* (디스크 크기 / 페이지당 섹터 수 = 총 페이지(슬롯) 수) */
     size_t swap_slots = block_size (swap_disk) / SECTORS_PER_PAGE;
     swap_table = bitmap_create (swap_slots);
     if (swap_table == NULL) {
-        return;
+        /* [수정] 조용히 리턴하는 대신 패닉 */
+        PANIC ("Failed to create swap table bitmap.");
     }
     
-    /* 3. 락 초기화 */
     lock_init (&swap_lock);
 }
 

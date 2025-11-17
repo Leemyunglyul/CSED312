@@ -18,6 +18,15 @@
 static void syscall_handler (struct intr_frame *);
 struct lock filesys_lock;
 
+static void unpin_all_frames_iterator(struct hash_elem *e, void *aux UNUSED) {
+    struct vm_entry *vme = hash_entry(e, struct vm_entry, elem);
+    vme->pinned = false;
+}
+
+static void unpin_all_frames(void) {
+    struct hash *vm = &thread_current()->vm;
+    hash_apply(vm, unpin_all_frames_iterator);
+}
 
 void force_exit(int status) {
     struct thread *cur = thread_current();
@@ -30,36 +39,30 @@ void force_exit(int status) {
     thread_exit();
 }
 
-/* userprog/syscall.c */
-
-/* [수정] bool을 반환하도록 변경 */
 static bool validate_address(const void *uaddr) {
     if (uaddr == NULL || uaddr >= PHYS_BASE || !is_user_vaddr(uaddr)) {
         return false;
     }
 
     struct thread *cur = thread_current();
+    void *fault_page = pg_round_down(uaddr);
     struct vm_entry *vme = vm_find(&cur->vm, pg_round_down(uaddr));
-    
     if (vme == NULL) {
-        /* [핵심 수정] SPT에 없으면 스택 확장 시도 */
-        /* cur->user_esp는 syscall_handler가 설정 */
         if (!grow_stack(uaddr, cur->user_esp)) {
             return false;
         }
-        /* * grow_stack이 vme를 생성하고 로드까지 했으므로
-         * * (혹은 vme->is_loaded = false로 설정했으므로)
-         * * vme를 다시 찾을 필요 없이, 로드만 확인하면 됩니다.
-         * * (grow_stack이 로드까지 하므로, 여기선 그냥 true 반환)
-         */
-        return true; 
+        vme = vm_find(&cur->vm, fault_page);
+        if (vme == NULL) {
+            /* grow_stack이 성공했는데 vme가 없으면 커널 오류 */
+            return false; 
+        }
     }
-
     if (!vme->is_loaded) {
         if (!load_page(vme)) { // 로드 실패
             return false;
         }
     }
+    vme->pinned = true; 
     return true; // 성공
 }
 
@@ -257,13 +260,13 @@ syscall_handler (struct intr_frame *f)
             f->eax = -1;
         } else {
             struct thread *cur = thread_current();
+            lock_acquire(&filesys_lock);
             if (cur->fd_table[fd_read] == NULL) {
                 f->eax = -1;
             } else {
-                lock_acquire(&filesys_lock);
                 f->eax = file_read(cur->fd_table[fd_read], buffer_read, size_read);
-                lock_release(&filesys_lock);
             }
+            lock_release(&filesys_lock);
         }
         break;
 
@@ -289,10 +292,9 @@ syscall_handler (struct intr_frame *f)
           if (file_to_write == NULL) { // 닫혔거나 없는 fd
               f->eax = -1;
           } else {
-              // file_write가 알아서 deny_write_cnt를 확인.
-              lock_acquire(&filesys_lock);
-              f->eax = file_write(file_to_write, buffer_write, size_write);
-              lock_release(&filesys_lock);
+            lock_acquire(&filesys_lock);
+            f->eax = file_write(file_to_write, buffer_write, size_write);
+            lock_release(&filesys_lock);
           }
       }
         break;
@@ -353,4 +355,5 @@ syscall_handler (struct intr_frame *f)
       force_exit(-1);
       break;
   }
+  unpin_all_frames();
 }

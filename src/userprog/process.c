@@ -20,6 +20,7 @@
 #include "userprog/syscall.h"
 #include "vm/frame.h"
 #include "vm/page.h"
+#include "lib/kernel/bitmap.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -536,7 +537,8 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
           vme->offset = current_ofs;
           vme->read_bytes = page_read_bytes;
           vme->zero_bytes = page_zero_bytes;
-          vme->swap_index = 0;
+          vme->swap_index = BITMAP_ERROR;
+          vme->pinned = false;
 
           if (!vm_insert(&thread_current()->vm, vme)) {
               free(vme);
@@ -587,7 +589,8 @@ setup_stack (void **esp)
         vme->is_loaded = true; // (이제 로드할 것임)
         vme->file = NULL;
         vme->thread = thread_current();
-        vme->swap_index = 0;
+        vme->swap_index = BITMAP_ERROR; // 스왑 없음
+        vme->pinned = false;
         
         if (!vm_insert (&cur->vm, vme)) {
             free(vme);

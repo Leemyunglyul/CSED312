@@ -32,6 +32,7 @@ struct vm_entry {
     struct list_elem f_elem; /* 프레임 테이블(list)용 elem */
     /* ============================== */
     struct thread *thread;
+    bool pinned;
 };
 
 

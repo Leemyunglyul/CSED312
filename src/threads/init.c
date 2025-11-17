@@ -99,7 +99,6 @@ main (void)
   /* Initialize memory system. */
   palloc_init (user_page_limit);
   frame_init ();
-  swap_init ();
   malloc_init ();
   paging_init ();
 
@@ -128,6 +127,9 @@ main (void)
   /* Initialize file system. */
   ide_init ();
   locate_block_devices ();
+#ifdef VM
+  swap_init ();           /* <<<--- [여기에 추가] --- */
+#endif
   filesys_init (format_filesys);
 #endif
 
