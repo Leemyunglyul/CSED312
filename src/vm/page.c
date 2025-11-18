@@ -26,6 +26,7 @@ vm_munmap_page (struct vm_entry *vme)
             
             off_t write_bytes = vme->read_bytes;
             off_t file_len = file_length(vme->file);
+            
             if (vme->offset + write_bytes > file_len) {
                  write_bytes = file_len - vme->offset;
             }
@@ -156,9 +157,11 @@ vm_destroy_func (struct hash_elem *e, void *aux UNUSED)
 {
     struct vm_entry *vme = hash_entry (e, struct vm_entry, elem);
 
-    if (vme->is_loaded || vme->swap_index != BITMAP_ERROR) {
+    /*if (vme->is_loaded || vme->swap_index != BITMAP_ERROR) {
         vm_munmap_page(vme);
-    }
+    }*/
+
+    vm_munmap_page(vme);
     
     free (vme);
 }

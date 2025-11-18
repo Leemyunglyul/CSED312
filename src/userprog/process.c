@@ -196,7 +196,7 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  munmap_process_exit();
+  //munmap_process_exit();
   vm_destroy (&cur->vm);
 
   if (cur->executable_file != NULL) {

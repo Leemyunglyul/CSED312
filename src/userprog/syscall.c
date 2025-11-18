@@ -377,46 +377,35 @@ static void munmap (mapid_t mapid) {
     while (true) {
         struct vm_entry *target_vme = NULL;
         struct hash_iterator i;
+
+        /* 1. 해시 테이블에서 해당 mapid를 가진 페이지 하나를 찾음 */
         hash_first(&i, vm);
         while (hash_next(&i)) {
             struct vm_entry *vme = hash_entry(hash_cur(&i), struct vm_entry, elem);
             if (vme->type == VM_FILE && vme->mapid == mapid) {
                 target_vme = vme;
-                break; 
+                break; /* 찾으면 즉시 중단 (삭제 후 재탐색 방식이 안전함) */
             }
         }
+
+        /* 더 이상 해당 mapid의 페이지가 없으면 종료 */
         if (target_vme == NULL) break;
 
-        if (file_to_close == NULL) file_to_close = target_vme->file;
-
-        if (target_vme->is_loaded) {
-            if (target_vme->writable && pagedir_is_dirty(cur->pagedir, target_vme->vaddr)) {
-                lock_acquire(&filesys_lock);
-                off_t file_len = file_length(target_vme->file);
-                off_t write_offset = target_vme->offset;
-                off_t write_len = target_vme->read_bytes;
-                
-                if (write_offset + write_len > file_len) {
-                     write_len = file_len - write_offset;
-                }
-                
-                if (write_len > 0) {
-                    file_write_at(target_vme->file, 
-                                   target_vme->kpage, 
-                                   write_len, 
-                                   write_offset);
-                     
-                    pagedir_set_dirty(cur->pagedir, target_vme->vaddr, false);
-                }
-                lock_release(&filesys_lock);
-            }
-            pagedir_clear_page(cur->pagedir, target_vme->vaddr);
-            frame_free(target_vme->kpage);
+        /* 2. 파일 포인터 백업 (마지막에 한 번만 닫기 위해) */
+        if (file_to_close == NULL) {
+            file_to_close = target_vme->file;
         }
+
+        /* 3. [핵심] 자원 해제 및 파일 쓰기 위임 */
+        /* vm_munmap_page가 Dirty 확인, 파일 쓰기, 매핑 해제, 프레임 반환을 모두 수행함 */
+        vm_munmap_page(target_vme);
+
+        /* 4. 해시 테이블에서 제거 및 vm_entry 메모리 해제 */
         hash_delete(vm, &target_vme->elem);
         free(target_vme);
     }
 
+    /* 5. 파일 닫기 (모든 페이지 처리가 끝난 후) */
     if (file_to_close != NULL) {
         lock_acquire(&filesys_lock);
         file_close(file_to_close);
