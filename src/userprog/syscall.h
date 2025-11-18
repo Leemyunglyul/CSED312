@@ -10,4 +10,4 @@ extern struct lock filesys_lock;
 void syscall_init (void);
 void force_exit (int status);
 
-#endif /* userprog/syscall.h */
+#endif

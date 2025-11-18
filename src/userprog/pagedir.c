@@ -156,7 +156,7 @@ pagedir_clear_page (uint32_t *pd, void *upage)
   pte = lookup_page (pd, upage, false);
   if (pte != NULL && (*pte & PTE_P))
   {
-    *pte = 0; // PTE를 0으로 설정하여 'not-present'로 만듦
+    *pte = 0;
   }
 }
 

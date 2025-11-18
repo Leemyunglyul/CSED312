@@ -102,6 +102,7 @@ start_process (void *file_name_)
 
   struct thread *cur = thread_current();
   vm_init (&cur->vm);
+  lock_init (&cur->spt_lock); 
 
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
@@ -196,6 +197,7 @@ process_exit (void)
   uint32_t *pd;
 
   munmap_process_exit();
+  vm_destroy (&cur->vm);
 
   if (cur->executable_file != NULL) {
       file_close(cur->executable_file);
@@ -234,7 +236,6 @@ process_exit (void)
       pagedir_destroy (pd);
     }
 
-    vm_destroy (&cur->vm);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -343,7 +344,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  lock_acquire(&filesys_lock);
+  lock_acquire(&filesys_lock); // ❗️ 락 획득
   file = filesys_open (file_name);
   if (file == NULL) 
     {
@@ -351,9 +352,12 @@ load (const char *file_name, void (**eip) (void), void **esp)
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
+  lock_release(&filesys_lock); // ❗️ 락 해제
 
+
+  lock_acquire(&filesys_lock); // ❗️ 락 획득
   file_deny_write(file);
-  lock_release(&filesys_lock); // 오픈 완료 후 해제
+  lock_release(&filesys_lock); // ❗️ 락 해제
   t->executable_file = file;
 
   lock_acquire(&filesys_lock);
@@ -378,9 +382,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
     {
       struct Elf32_Phdr phdr;
 
+      lock_acquire(&filesys_lock);
       if (file_ofs < 0 || file_ofs > file_length (file))
         goto done;
-      lock_acquire(&filesys_lock);
       file_seek (file, file_ofs);
 
       if (file_read (file, &phdr, sizeof phdr) != sizeof phdr) {
@@ -429,10 +433,11 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  if (!success && file != NULL) {
+  //lock_release(&filesys_lock);
+  /*if (!success && file != NULL) {
     file_close(file);
     t->executable_file = NULL;
-  }
+  }*/
   return success;
 }
 

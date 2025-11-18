@@ -8,7 +8,6 @@
 
 void frame_init (void);
 void *frame_alloc (struct vm_entry *vme, enum palloc_flags flags);
-/* 프레임(kpage)에 연결된 vm_entry를 테이블에서 제거하고 프레임 반환 */
 void frame_free (void *kpage);
 
-#endif /* vm/frame.h */
+#endif

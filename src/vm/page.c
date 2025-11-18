@@ -17,22 +17,33 @@ void
 vm_munmap_page (struct vm_entry *vme)
 {
     if (vme->is_loaded) {
-        /* 1. Dirty하면 파일에 쓰기 (Write-back) */
         if (vme->type == VM_FILE && pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
             lock_acquire(&filesys_lock);
-            file_write_at(vme->file, 
-                          vme->kpage + (vme->offset % PGSIZE), 
-                          vme->read_bytes, 
-                          vme->offset);
+
+            off_t file_len = file_length(vme->file);
+            off_t write_offset = vme->offset;
+            off_t write_len = vme->read_bytes;
+            
+            if (write_offset + write_len > file_len) {
+                 write_len = file_len - write_offset;
+            }
+            
+            if (write_len > 0) {
+                 file_write_at(vme->file, 
+                               vme->kpage, 
+                               write_len, 
+                               write_offset);
+                 
+                 pagedir_set_dirty(vme->thread->pagedir, vme->vaddr, false);
+            }
+
             lock_release(&filesys_lock);
         }
         
-        /* 2. PTE 해제 및 프레임 해제 */
         pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
-        frame_free(vme->kpage); // vme->kpage는 여기서 NULL로 설정됨
+        frame_free(vme->kpage);
     }
     
-    /* 3. 스왑 슬롯 해제 */
     if (vme->swap_index != BITMAP_ERROR) {
         swap_free(vme->swap_index);
     }
@@ -41,33 +52,19 @@ vm_munmap_page (struct vm_entry *vme)
 bool
 grow_stack (void *fault_addr, void *esp)
 {
-    /* 1. 8MB 스택 제한 확인 */
     if (fault_addr < (PHYS_BASE - STACK_MAX_SIZE) || fault_addr >= PHYS_BASE) {
         return false;
     }
 
-    /* === [핵심 수정] === */
-    /* * Heuristic:
-     * 1. PUSH/PUSHA (최대 esp - 32) 허용
-     * 2. mov [esp+m] (fault_addr >= esp) 허용
-     * 3. pt-grow-stack/pt-big-stk-obj (sub %esp 후 접근, fault_addr >= esp) 허용
-     * * 따라서 fault_addr가 (esp - 32) 보다 낮으면 거부합니다.
-     */
     if (fault_addr < (esp - 32)) {
-        /* pt-grow-bad (esp - 4097)는 여기서 거부됩니다. */
         return false;
     }
-    /* ================== */
-
-    /* 3. 새 스택 페이지(VM_ANON) 생성 */
     void *stack_page = pg_round_down(fault_addr);
     
-    /* (이미 할당된 페이지인지 한 번 더 확인) */
     if (vm_find(&thread_current()->vm, stack_page) != NULL) {
         return false;
     }
 
-    /* (Turn 47의 나머지 로직과 동일) */
     struct vm_entry *vme = malloc(sizeof(struct vm_entry));
     if (vme == NULL) return false;
 
@@ -77,7 +74,7 @@ grow_stack (void *fault_addr, void *esp)
     vme->is_loaded = false;
     vme->file = NULL;
     vme->thread = thread_current();
-    vme->swap_index = BITMAP_ERROR; // 스왑 없음
+    vme->swap_index = BITMAP_ERROR; 
     vme->pinned = false;
 
     if (!vm_insert (&thread_current()->vm, vme)) {
@@ -94,7 +91,6 @@ grow_stack (void *fault_addr, void *esp)
     return true;
 }
 
-/* 가상 주소(vaddr)를 해시 값으로 변환하는 함수 */
 static unsigned
 vm_hash_func (const struct hash_elem *e, void *aux UNUSED)
 {
@@ -102,7 +98,6 @@ vm_hash_func (const struct hash_elem *e, void *aux UNUSED)
     return hash_bytes (&vme->vaddr, sizeof (vme->vaddr));
 }
 
-/* 두 해시 요소를 비교하는 함수 (a < b) */
 static bool
 vm_less_func (const struct hash_elem *a, const struct hash_elem *b,
               void *aux UNUSED)
@@ -112,138 +107,103 @@ vm_less_func (const struct hash_elem *a, const struct hash_elem *b,
     return vme_a->vaddr < vme_b->vaddr;
 }
 
-/* SPT(해시 테이블) 초기화 */
 void
 vm_init (struct hash *vm)
 {
     hash_init (vm, vm_hash_func, vm_less_func, NULL);
 }
 
-/* 가상 주소(vaddr)로 SPT 항목(vm_entry) 찾기 */
 struct vm_entry *
 vm_find (struct hash *vm, void *vaddr)
 {
     struct vm_entry vme_temp;
     struct hash_elem *e;
-
-    /* vaddr은 페이지 시작 주소여야 함 */
     vme_temp.vaddr = pg_round_down (vaddr);
     
+    lock_acquire(&thread_current()->spt_lock);
     e = hash_find (vm, &vme_temp.elem);
+    lock_release(&thread_current()->spt_lock); 
     if (e == NULL) {
         return NULL;
     }
     return hash_entry (e, struct vm_entry, elem);
 }
 
-/* SPT에 항목(vm_entry) 추가 */
 bool
 vm_insert (struct hash *vm, struct vm_entry *vme)
 {
-    return hash_insert (vm, &vme->elem) == NULL; // 성공 시 NULL 반환
+    lock_acquire(&thread_current()->spt_lock); 
+    bool success = hash_insert (vm, &vme->elem) == NULL;
+    lock_release(&thread_current()->spt_lock); 
+    return success;
 }
 
-/* SPT에서 항목(vm_entry) 제거 */
 bool
 vm_delete (struct hash *vm, struct vm_entry *vme)
 {
-    return hash_delete (vm, &vme->elem) != NULL; // 성공 시 삭제된 elem 반환
+    lock_acquire(&thread_current()->spt_lock);
+    bool success = hash_delete (vm, &vme->elem) != NULL;
+    lock_release(&thread_current()->spt_lock);
+    return success;
 }
 
-/* SPT 항목(vm_entry)과 관련 리소스 해제 */
 static void
 vm_destroy_func (struct hash_elem *e, void *aux UNUSED)
 {
     struct vm_entry *vme = hash_entry (e, struct vm_entry, elem);
 
-    /* 1. Loaded 또는 Swapped 페이지의 자원 해제 */
     if (vme->is_loaded || vme->swap_index != BITMAP_ERROR) {
-        /* vm_munmap_page는 VM_FILE의 write-back도 처리함 */
         vm_munmap_page(vme);
     }
     
-    /* 2. vm_entry 구조체 자체를 해제 */
     free (vme);
 }
 
-/* SPT(해시 테이블) 전체 삭제 */
 void
 vm_destroy (struct hash *vm)
 {
+    lock_acquire(&thread_current()->spt_lock);
     hash_destroy (vm, vm_destroy_func);
+    lock_release(&thread_current()->spt_lock);
 }
 
-/* vm_entry의 정보에 따라 물리 프레임에 데이터를 로드 */
 bool 
 load_page (struct vm_entry *vme)
 {
-    if (vme->is_loaded) {
-        return true;
-    }
-    /* 1. 물리 프레임 할당 (1단계에서 만든 frame_alloc 사용) */
+    if (vme->is_loaded) return true;
+
     void *kpage = frame_alloc (vme, PAL_USER | PAL_ZERO);
-    if (kpage == NULL) {
+    if (kpage == NULL) return false;
+
+    bool lock_held = lock_held_by_current_thread(&filesys_lock);
+
+    if (vme->type == VM_BIN || vme->type == VM_FILE) {
+        if (vme->swap_index == BITMAP_ERROR) {
+             if (!lock_held) lock_acquire(&filesys_lock);
+             
+             if (file_read_at(vme->file, kpage + (vme->offset % PGSIZE), 
+                              vme->read_bytes, vme->offset) != (int)vme->read_bytes) {
+                 if (!lock_held) lock_release(&filesys_lock);
+                 frame_free(kpage);
+                 return false;
+             }
+             
+             if (!lock_held) lock_release(&filesys_lock);
+        } else {
+            swap_in(vme->swap_index, kpage);
+            swap_free(vme->swap_index);
+        }
+    } else if (vme->type == VM_ANON) {
+        if (vme->swap_index != BITMAP_ERROR) {
+            swap_in(vme->swap_index, kpage);
+            swap_free(vme->swap_index);
+        }
+    }
+    if (!install_page(vme->vaddr, kpage, vme->writable)) {
+        frame_free(kpage);
         return false;
     }
 
-    bool lock_already_held = lock_held_by_current_thread(&filesys_lock);
-
-    size_t page_offset = vme->offset % PGSIZE;
-
-    /* 2. vm_entry 타입에 따라 데이터 로드 */
-    switch (vme->type) 
-    {
-        case VM_BIN: // 실행 파일에서 읽기
-            if (vme->swap_index != BITMAP_ERROR) {
-                /* 1. 스왑에서 읽기 */
-                swap_in (vme->swap_index, kpage);
-                swap_free (vme->swap_index);
-            } else {
-                /* 2. 스왑에 없으면 파일에서 읽기 (기존 로직) */
-                if (!lock_already_held) lock_acquire(&filesys_lock);
-                if (file_read_at (vme->file, kpage + page_offset, 
-                                vme->read_bytes, vme->offset) != (int)vme->read_bytes) 
-                {
-                    if (!lock_already_held) lock_release(&filesys_lock);
-                    frame_free (kpage);
-                    return false;
-                }
-                if (!lock_already_held) lock_release(&filesys_lock);
-                
-            }
-            break;
-
-        case VM_ANON: 
-            if (vme->swap_index != BITMAP_ERROR) { 
-                swap_in (vme->swap_index, kpage);
-                swap_free (vme->swap_index);
-            }
-            break;
-            
-        case VM_FILE: /* <<< [추가] mmap 파일 로드 */
-            if (!lock_already_held) lock_acquire(&filesys_lock);
-            
-            /* VM_BIN과 동일하게 파일에서 읽어옴 */
-            if (file_read_at (vme->file, kpage + (vme->offset % PGSIZE),
-                            vme->read_bytes, vme->offset)
-                != (int)vme->read_bytes)
-            {
-                if (!lock_already_held) lock_release(&filesys_lock);
-                frame_free(kpage);
-                return false;
-            }
-            
-            if (!lock_already_held) lock_release(&filesys_lock);
-            break;
-    }
-
-    /* 3. 하드웨어 페이지 테이블(pagedir)에 매핑 */
-    if (!install_page (vme->vaddr, kpage, vme->writable)) {
-        frame_free (kpage);
-        return false;
-    }
-
-    /* 4. SPT 상태 업데이트 */
     vme->is_loaded = true;
     vme->swap_index = BITMAP_ERROR;
     return true;
@@ -256,33 +216,83 @@ munmap_helper (struct hash_elem *e, void *aux)
     struct vm_entry *vme = hash_entry(e, struct vm_entry, elem);
 
     if (vme->type == VM_FILE && vme->mapid == *mapid) {
-        /* mmap_exit과 동일한 로직 수행 */
         
         if (vme->is_loaded) {
-            /* 1. Dirty하면 파일에 쓰기 */
             if (pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
                 lock_acquire(&filesys_lock);
                 file_write_at(vme->file, 
-                              vme->kpage + (vme->offset % PGSIZE), 
+                              vme->kpage, 
                               vme->read_bytes, 
                               vme->offset);
                 lock_release(&filesys_lock);
             }
-            /* 2. 프레임 해제 */
             frame_free(vme->kpage);
             pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
         }
         
-        /* 3. SPT에서 vme 제거 (hash_delete는 hash_apply 도중 사용하면 위험) */
-        /* (우선 vme만 free. 또는 hash_iterator/delete 사용 필요) */
         
-        /* vme->file은 닫지 않음 (file_close는 munmap_internal에서 한꺼번에) */
-        // free(vme); // (해시 순회 중 free는 위험!)
+    }
+}
+
+static void
+do_munmap_internal (mapid_t mapid)
+{
+    struct thread *cur = thread_current();
+    struct hash *vm = &cur->vm;
+    struct file *file_to_close = NULL;
+
+    lock_acquire(&cur->spt_lock);
+
+    while (true) {
+        struct vm_entry *target_vme = NULL;
+        struct hash_iterator i;
         
-        /* * 안전한 삭제를 위해 vme->type을 VM_BIN(임시) 등으로 바꿔 
-         * * 나중에 vm_destroy_func에서 free하게 하거나,
-         * * 별도 리스트에 모았다가 삭제해야 함.
-         */
+        hash_first(&i, vm);
+        while (hash_next(&i)) {
+            struct vm_entry *vme = hash_entry(hash_cur(&i), struct vm_entry, elem);
+            if (vme->type == VM_FILE && vme->mapid == mapid) {
+                target_vme = vme;
+                break; 
+            }
+        }
+
+        if (target_vme == NULL) break;
+
+        if (file_to_close == NULL) file_to_close = target_vme->file;
+
+        if (target_vme->is_loaded) {
+            if (target_vme->writable && pagedir_is_dirty(cur->pagedir, target_vme->vaddr)) {
+                lock_acquire(&filesys_lock);
+                off_t file_len = file_length(target_vme->file);
+                off_t write_offset = target_vme->offset;
+                off_t write_len = target_vme->read_bytes;
+                
+                if (write_offset + write_len > file_len) {
+                    write_len = file_len - write_offset;
+                }
+                
+                if (write_len > 0) {
+                    file_write_at(target_vme->file, 
+                                target_vme->kpage, 
+                                write_len, 
+                                write_offset);
+                    pagedir_set_dirty(cur->pagedir, target_vme->vaddr, false);
+                }
+                lock_release(&filesys_lock);
+            }
+            frame_free(target_vme->kpage);
+            pagedir_clear_page(cur->pagedir, target_vme->vaddr);
+        }
+        
+        hash_delete(vm, &target_vme->elem);
+        free(target_vme);
+    }
+    lock_release(&cur->spt_lock);
+
+    if (file_to_close != NULL) {
+        lock_acquire(&filesys_lock);
+        file_close(file_to_close);
+        lock_release(&filesys_lock);
     }
 }
 
@@ -292,34 +302,26 @@ munmap_process_exit (void)
     struct thread *cur = thread_current();
     struct hash *vm = &cur->vm;
     
-    struct hash_iterator i;
-    struct file *file_to_close = NULL; 
+    while (true) {
+        mapid_t target_mapid = -1;
+        bool found = false;
+        struct hash_iterator i;
 
-    hash_first (&i, vm);
-    while (hash_next (&i))
-    {
-        struct vm_entry *vme = hash_entry (hash_cur (&i), struct vm_entry, elem);
-
-        if (vme->type == VM_FILE) 
-        {
-            if (file_to_close == NULL) {
-                file_to_close = vme->file; // 닫아야 할 파일 저장
+        lock_acquire(&cur->spt_lock);
+        hash_first (&i, vm);
+        while (hash_next (&i)) {
+            struct vm_entry *vme = hash_entry (hash_cur (&i), struct vm_entry, elem);
+            if (vme->type == VM_FILE) {
+                target_mapid = vme->mapid;
+                found = true;
+                break; 
             }
-            
-            // Write-back 및 프레임 해제 (vm_munmap_page 사용)
-            vm_munmap_page(vme); 
-            
-            // SPT에서 vme 제거 및 vme 구조체 해제
-            hash_delete (vm, &vme->elem);
-            hash_first(&i, vm); // [안전한 삭제] 반복자 리셋
-            free (vme);
         }
-    }
-    
-    // 4. mmap이 reopen한 파일 닫기
-    if (file_to_close != NULL) {
-        lock_acquire(&filesys_lock);
-        file_close(file_to_close);
-        lock_release(&filesys_lock);
+        lock_release(&cur->spt_lock);
+
+        if (!found){
+            break;
+        }
+        do_munmap_internal(target_mapid);
     }
 }

@@ -14,22 +14,13 @@
 #include "filesys/filesys.h"
 #include "filesys/inode.h" 
 #include "vm/page.h"
-#include "threads/malloc.h" // mmap에서 vm_entry 생성 시 필요
+#include "vm/frame.h"
+#include "threads/malloc.h"
 #include "lib/kernel/bitmap.h"
 #include <hash.h>
 
 static void syscall_handler (struct intr_frame *);
 struct lock filesys_lock;
-
-static void unpin_all_frames_iterator(struct hash_elem *e, void *aux UNUSED) {
-    struct vm_entry *vme = hash_entry(e, struct vm_entry, elem);
-    vme->pinned = false;
-}
-
-static void unpin_all_frames(void) {
-    struct hash *vm = &thread_current()->vm;
-    hash_apply(vm, unpin_all_frames_iterator);
-}
 
 void force_exit(int status) {
     struct thread *cur = thread_current();
@@ -42,484 +33,393 @@ void force_exit(int status) {
     thread_exit();
 }
 
-static bool validate_address(const void *uaddr) {
+static struct vm_entry *check_address(void *uaddr, void *esp) {
     if (uaddr == NULL || uaddr >= PHYS_BASE || !is_user_vaddr(uaddr)) {
-        return false;
+        return NULL;
     }
 
     struct thread *cur = thread_current();
     void *fault_page = pg_round_down(uaddr);
-    struct vm_entry *vme = vm_find(&cur->vm, pg_round_down(uaddr));
+    struct vm_entry *vme = vm_find(&cur->vm, fault_page);
+    
     if (vme == NULL) {
-        if (!grow_stack(uaddr, cur->user_esp)) {
-            return false;
-        }
-        vme = vm_find(&cur->vm, fault_page);
-        if (vme == NULL) {
-            /* grow_stack이 성공했는데 vme가 없으면 커널 오류 */
-            return false; 
-        }
+        return NULL;
     }
+    
     if (!vme->is_loaded) {
-        if (!load_page(vme)) { // 로드 실패
-            return false;
-        }
+        if (!load_page(vme)) return NULL;
     }
-    vme->pinned = true; 
-    return true; // 성공
+    return vme;
 }
 
-/* [수정] bool을 반환하도록 변경 */
-static bool validate_buffer(const void *uaddr, unsigned size) {
-    if (size == 0) return true;
-
-    char *ptr = (char *) pg_round_down(uaddr);
-    char *end = (char *) uaddr + size;
-
-    while (ptr < end) {
-        if (!validate_address(ptr)) return false;
-        ptr += PGSIZE;
+static void
+check_valid_buffer (void *buffer, size_t size, bool to_write)
+{
+    if (buffer == NULL) {
+        force_exit(-1);
     }
-    
-    /* * 버퍼의 마지막 바이트도 검사합니다.
-     * * (size가 0이 아님은 위에서 확인했습니다.)
-     */
-    if (!validate_address((const char *)uaddr + size - 1)) return false;
-    
+  
+    struct thread *cur = thread_current();
+    void *page;
+
+    for (page = pg_round_down(buffer); 
+         page <= pg_round_down(buffer + size - 1); 
+         page += PGSIZE)
+    {
+        struct vm_entry *vme = check_address(page, cur->user_esp);
+        if (vme == NULL) {
+            force_exit(-1);
+        }
+       if (to_write && !vme->writable) {
+            force_exit(-1);
+        }
+    }
+}
+
+static bool check_page_and_pin(void *addr, bool to_write) {
+    struct vm_entry *vme = check_address(addr, thread_current()->user_esp);
+    if (vme == NULL) return false;
+    if (to_write && !vme->writable) return false;
+    vme->pinned = true;
     return true;
 }
 
-/* [수정] bool을 반환하도록 변경 */
+static void unpin_page(void *addr) {
+    struct vm_entry *vme = vm_find(&thread_current()->vm, pg_round_down(addr));
+    if (vme) vme->pinned = false;
+}
+
 static bool validate_string(const char *uaddr) {
-    if (!validate_address(uaddr)) return false; // 첫 페이지 검사
+    if (check_address((void *)uaddr, thread_current()->user_esp) == NULL) return false;
     
     const char *page = pg_round_down(uaddr);
-    while (true) {
-        /* * 페이지 경계를 넘어가면, 다음 페이지도 
-         * * validate (및 로드)해야 합니다.
-         */
+    while (*uaddr != '\0') {
+        uaddr++;
         if (pg_round_down(uaddr) != page) {
             page = pg_round_down(uaddr);
-            if (!validate_address(uaddr)) return false;
+            if (check_address((void *)uaddr, thread_current()->user_esp) == NULL) return false;
         }
-        
-        /* * validate_address()가 이 페이지를 메모리에 로드했음을
-         * * 보장하므로, *uaddr 역참조는 안전합니다.
-         */
-        if (*uaddr == '\0')
-            break;
-            
-        uaddr++; // 다음 바이트로 이동
     }
     return true;
 }
 
-static mapid_t
-mmap (int fd, void *addr)
-{
+static mapid_t mmap (int fd, void *addr); 
+static void munmap (mapid_t mapid);
+
+void syscall_init (void) {
+    intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+    lock_init(&filesys_lock);
+}
+
+static void syscall_handler (struct intr_frame *f) {
     struct thread *cur = thread_current();
+    cur->user_esp = f->esp;
 
-    /* 1. 주소 유효성 검사 */
-    if (addr == NULL || pg_ofs(addr) != 0) {
-        return -1; // 널 포인터 또는 페이지 정렬 안 됨
-    }
+    if (check_address(f->esp, f->esp) == NULL) force_exit(-1);
 
-    /* 2. fd 유효성 검사 */
-    if (fd == 0 || fd == 1) {
-        return -1; // STDIN/STDOUT 매핑 불가
+    int syscall_number = *(int *)(f->esp);
+
+    switch (syscall_number) {
+        case SYS_HALT: shutdown_power_off(); break;
+
+        case SYS_EXIT:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            int status = *(int *)(f->esp + 4);
+            if (cur->executable_file) file_allow_write(cur->executable_file);
+            force_exit(status);
+            break;
+
+        case SYS_EXEC:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            if (!validate_string(*(char **)(f->esp + 4))) force_exit(-1);
+            f->eax = process_execute(*(char **)(f->esp + 4));
+            break;
+
+        case SYS_WAIT:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            f->eax = process_wait(*(tid_t *)(f->esp + 4));
+            break;
+
+        case SYS_CREATE:
+            if (!check_address(f->esp + 4, f->esp) || !check_address(f->esp + 8, f->esp)) force_exit(-1);
+            if (!validate_string(*(char **)(f->esp + 4))) force_exit(-1);
+            lock_acquire(&filesys_lock);
+            f->eax = filesys_create(*(char **)(f->esp + 4), *(unsigned *)(f->esp + 8));
+            lock_release(&filesys_lock);
+            break;
+
+        case SYS_REMOVE:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            if (!validate_string(*(char **)(f->esp + 4))) force_exit(-1);
+            lock_acquire(&filesys_lock);
+            f->eax = filesys_remove(*(char **)(f->esp + 4));
+            lock_release(&filesys_lock);
+            break;
+
+        case SYS_OPEN:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            if (!validate_string(*(char **)(f->esp + 4))) force_exit(-1);
+            lock_acquire(&filesys_lock);
+            struct file *file_obj = filesys_open(*(char **)(f->esp + 4));
+            lock_release(&filesys_lock);
+            if (!file_obj) f->eax = -1;
+            else if (cur->next_fd < FDT_SIZE) cur->fd_table[cur->next_fd++] = file_obj, f->eax = cur->next_fd - 1;
+            else file_close(file_obj), f->eax = -1;
+            break;
+
+        case SYS_FILESIZE:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            int fd_sz = *(int *)(f->esp + 4);
+            if (fd_sz < 2 || fd_sz >= FDT_SIZE || !cur->fd_table[fd_sz]) f->eax = -1;
+            else {
+                lock_acquire(&filesys_lock);
+                f->eax = file_length(cur->fd_table[fd_sz]);
+                lock_release(&filesys_lock);
+            }
+            break;
+        case SYS_READ:
+        {
+            if (!check_address(f->esp + 4, f->esp) || !check_address(f->esp + 8, f->esp) || !check_address(f->esp + 12, f->esp)) force_exit(-1);
+            int fd = *(int *)(f->esp + 4);
+            void *buf = *(void **)(f->esp + 8);
+            unsigned size = *(unsigned *)(f->esp + 12);
+            int bytes_read = 0;
+            check_valid_buffer(buf, size, true);
+
+            while (size > 0) {
+                size_t chunk_size = PGSIZE - pg_ofs(buf);
+                if (chunk_size > size) chunk_size = size;
+
+                if (!check_page_and_pin(buf, true)) force_exit(-1);
+
+                int ret = 0;
+                if (fd == 0) {
+                    for (size_t i = 0; i < chunk_size; i++) ((uint8_t*)buf)[i] = input_getc();
+                    ret = chunk_size;
+                } else if (fd >= 2 && fd < FDT_SIZE && cur->fd_table[fd]) {
+                    lock_acquire(&filesys_lock);
+                    ret = file_read(cur->fd_table[fd], buf, chunk_size);
+                    lock_release(&filesys_lock);
+                } else {
+                    unpin_page(buf);
+                    f->eax = -1; 
+                    return; 
+                }
+
+                unpin_page(buf);
+
+                if (ret < 0) { f->eax = -1; return; }
+                bytes_read += ret;
+                if (ret < (int)chunk_size) break;
+
+                buf += chunk_size;
+                size -= chunk_size;
+            }
+            f->eax = bytes_read;
+            break;
+        }
+
+        case SYS_WRITE:
+        {
+            if (!check_address(f->esp + 4, f->esp) || !check_address(f->esp + 8, f->esp) || !check_address(f->esp + 12, f->esp)) force_exit(-1);
+            int fd = *(int *)(f->esp + 4);
+            void *buf = *(void **)(f->esp + 8);
+            unsigned size = *(unsigned *)(f->esp + 12);
+            int bytes_written = 0;
+            check_valid_buffer(buf, size, false);
+
+            /* [Chunking Loop] */
+            while (size > 0) {
+                size_t chunk_size = PGSIZE - pg_ofs(buf);
+                if (chunk_size > size) chunk_size = size;
+
+                if (!check_page_and_pin(buf, false)) force_exit(-1);
+
+                int ret = 0;
+                if (fd == 1) {
+                    putbuf(buf, chunk_size);
+                    ret = chunk_size;
+                } else if (fd >= 2 && fd < FDT_SIZE && cur->fd_table[fd]) {
+                    lock_acquire(&filesys_lock);
+                    ret = file_write(cur->fd_table[fd], buf, chunk_size);
+                    lock_release(&filesys_lock);
+                } else {
+                    unpin_page(buf);
+                    f->eax = -1;
+                    return;
+                }
+
+                unpin_page(buf);
+
+                if (ret < 0) { f->eax = -1; return; }
+                bytes_written += ret;
+                
+                buf += chunk_size;
+                size -= chunk_size;
+            }
+            f->eax = bytes_written;
+            break;
+        }
+
+        case SYS_SEEK:
+            if (!check_address(f->esp + 4, f->esp) || !check_address(f->esp + 8, f->esp)) force_exit(-1);
+            int fd_sk = *(int *)(f->esp + 4);
+            unsigned pos = *(unsigned *)(f->esp + 8);
+            if (fd_sk >= 2 && fd_sk < FDT_SIZE && cur->fd_table[fd_sk]) {
+                lock_acquire(&filesys_lock);
+                file_seek(cur->fd_table[fd_sk], pos);
+                lock_release(&filesys_lock);
+            }
+            break;
+
+        case SYS_TELL:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            int fd_tl = *(int *)(f->esp + 4);
+            if (fd_tl >= 2 && fd_tl < FDT_SIZE && cur->fd_table[fd_tl]) {
+                lock_acquire(&filesys_lock);
+                f->eax = file_tell(cur->fd_table[fd_tl]);
+                lock_release(&filesys_lock);
+            } else f->eax = -1;
+            break;
+
+        case SYS_CLOSE:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            int fd_cl = *(int *)(f->esp + 4);
+            if (fd_cl >= 2 && fd_cl < FDT_SIZE && cur->fd_table[fd_cl]) {
+                lock_acquire(&filesys_lock);
+                file_close(cur->fd_table[fd_cl]);
+                lock_release(&filesys_lock);
+                cur->fd_table[fd_cl] = NULL;
+            } else force_exit(-1);
+            break;
+
+        case SYS_MMAP:
+            if (!check_address(f->esp + 4, f->esp) || !check_address(f->esp + 8, f->esp)) force_exit(-1);
+            f->eax = mmap(*(int *)(f->esp + 4), *(void **)(f->esp + 8));
+            break;
+            
+        case SYS_MUNMAP:
+            if (!check_address(f->esp + 4, f->esp)) force_exit(-1);
+            munmap(*(mapid_t *)(f->esp + 4));
+            f->eax = 0;
+            break;
+
+        default: force_exit(-1); break;
     }
+}
+
+static mapid_t mmap (int fd, void *addr) {
+    struct thread *cur = thread_current();
+    if (addr == NULL || pg_ofs(addr) != 0) return -1;
+    if (fd == 0 || fd == 1) return -1;
     struct file *file = cur->fd_table[fd];
-    if (file == NULL) {
-        return -1; // 유효하지 않은 fd
-    }
-    
-    /* 3. 파일 길이 검사 */
+    if (file == NULL) return -1;
+
     lock_acquire(&filesys_lock);
     off_t file_len = file_length(file);
     lock_release(&filesys_lock);
-    
-    if (file_len == 0) {
-        return -1; // 빈 파일 매핑 불가
-    }
+    if (file_len == 0) return -1;
 
-    /* 4. [중요] file_reopen: mmap이 유지되는 동안 
-     * 다른 곳(e.g. close(fd))에서 파일을 닫아도 
-     * 커널은 이 파일을 계속 참조해야 함.
-     */
     lock_acquire(&filesys_lock);
     struct file *reopened_file = file_reopen(file);
     lock_release(&filesys_lock);
-    if (reopened_file == NULL) {
-        return -1; // 파일 리오픈 실패
-    }
-    
-    /* 5. 페이지 겹침(Overlap) 검사 */
-    /* (파일을 페이지 단위로 순회하며) */
+    if (reopened_file == NULL) return -1;
+
     void *current_addr = addr;
     off_t current_offset = 0;
-    while (current_offset < file_len) 
-    {
+    while (current_offset < file_len) {
         if (vm_find(&cur->vm, current_addr) != NULL) {
-            file_close(reopened_file); // 실패 시 리오픈한 파일 닫기
-            return -1; // 이미 SPT에 매핑된 주소 (겹침)
+            file_close(reopened_file);
+            return -1;
         }
         current_addr += PGSIZE;
         current_offset += PGSIZE;
     }
-    
-    /* 6. 모든 검사 통과 -> vm_entry 생성 (지연 로딩 설정) */
+
     mapid_t mapid = cur->next_mapid++;
     current_addr = addr;
     current_offset = 0;
-    
-    while (current_offset < file_len)
-    {
+    while (current_offset < file_len) {
         struct vm_entry *vme = malloc(sizeof(struct vm_entry));
         if (vme == NULL) {
-            /* (TODO: 실패 시 지금까지 만든 vme들 롤백해야 함) */
             file_close(reopened_file);
-            return -1; 
+            return -1;
         }
-
-        vme->type = VM_FILE; // mmap 타입
+        vme->type = VM_FILE;
         vme->vaddr = current_addr;
-        vme->writable = true; // mmap은 기본적으로 쓰기 가능
+        vme->writable = true;
         vme->is_loaded = false;
         vme->file = reopened_file;
         vme->thread = cur;
         vme->pinned = false;
-        
         vme->offset = current_offset;
         vme->read_bytes = (file_len - current_offset < PGSIZE) ? (file_len - current_offset) : PGSIZE;
         vme->zero_bytes = PGSIZE - vme->read_bytes;
-        
         vme->swap_index = BITMAP_ERROR;
-        vme->mapid = mapid; // 이 vme가 속한 map ID
+        vme->mapid = mapid;
         
         if (!vm_insert(&cur->vm, vme)) {
-             /* (TODO: 롤백) */
             free(vme);
             file_close(reopened_file);
             return -1;
         }
-
         current_addr += PGSIZE;
         current_offset += PGSIZE;
     }
-    
     return mapid;
 }
 
-/* munmap 헬퍼 함수 (일단 뼈대만) */
-/* userprog/syscall.c -> munmap() */
-
-static void
-munmap (mapid_t mapid)
-{
+static void munmap (mapid_t mapid) {
     struct thread *cur = thread_current();
     struct hash *vm = &cur->vm;
-    struct hash_iterator i;
-    struct file *file_to_close = NULL; 
+    struct file *file_to_close = NULL;
 
-    /* [수정 1] 루프를 돌면서 삭제하면 안 되므로, 
-       '삭제할 대상이 없을 때까지' 반복해서 처음부터 찾습니다. */
     while (true) {
         struct vm_entry *target_vme = NULL;
-        
+        struct hash_iterator i;
         hash_first(&i, vm);
         while (hash_next(&i)) {
             struct vm_entry *vme = hash_entry(hash_cur(&i), struct vm_entry, elem);
             if (vme->type == VM_FILE && vme->mapid == mapid) {
                 target_vme = vme;
-                break; // 대상을 찾으면 탐색 중단
+                break; 
             }
         }
+        if (target_vme == NULL) break;
 
-        if (target_vme == NULL) {
-            break; // 더 이상 지울 게 없으면 종료
+        if (file_to_close == NULL) file_to_close = target_vme->file;
+
+        if (target_vme->is_loaded) {
+            if (target_vme->writable && pagedir_is_dirty(cur->pagedir, target_vme->vaddr)) {
+                lock_acquire(&filesys_lock);
+                off_t file_len = file_length(target_vme->file);
+                off_t write_offset = target_vme->offset;
+                off_t write_len = target_vme->read_bytes;
+                
+                if (write_offset + write_len > file_len) {
+                     write_len = file_len - write_offset;
+                }
+                
+                if (write_len > 0) {
+                    file_write_at(target_vme->file, 
+                                   target_vme->kpage + (target_vme->offset % PGSIZE), 
+                                   write_len, 
+                                   write_offset);
+                     
+                    pagedir_set_dirty(cur->pagedir, target_vme->vaddr, false);
+                }
+                lock_release(&filesys_lock);
+            }
+            frame_free(target_vme->kpage);
+            pagedir_clear_page(cur->pagedir, target_vme->vaddr);
         }
-
-        /* 파일을 닫기 위해 포인터 저장 (모든 페이지가 공유하므로 하나만 알면 됨) */
-        if (file_to_close == NULL) {
-            file_to_close = target_vme->file;
-        }
-
-        /* 페이지 정리 및 삭제 */
-        vm_munmap_page(target_vme); 
         hash_delete(vm, &target_vme->elem);
         free(target_vme);
     }
 
-    /* [수정 2] 모든 페이지 해제가 끝난 후 안전하게 파일을 닫습니다. */
     if (file_to_close != NULL) {
         lock_acquire(&filesys_lock);
         file_close(file_to_close);
         lock_release(&filesys_lock);
     }
-}
-
-void
-syscall_init (void) 
-{
-  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
-  lock_init(&filesys_lock);
-}
-
-static void
-syscall_handler (struct intr_frame *f) 
-{
-    struct thread *cur = thread_current();
-    cur->user_esp = f->esp; // [핵심 추가] 유저 esp 저장
-
-    if (!validate_address(f->esp)) {
-        force_exit(-1);
-    }
-
-    int syscall_number = *(int *)(f->esp);
-
-
-  switch (syscall_number) {
-    case SYS_HALT:
-        shutdown_power_off();
-        break;
-
-    case SYS_EXIT:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        int status = *(int *)(f->esp + 4);
-        if (cur->executable_file != NULL) {
-            file_allow_write(cur->executable_file);
-        }
-        force_exit(status); 
-        break;
-
-    case SYS_EXEC:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        const char *cmd_line = *(const char **)(f->esp + 4);
-        if (!validate_string(cmd_line)) {
-            force_exit(-1);
-        }
-        f->eax = process_execute(cmd_line);
-        break;
-
-    case SYS_WAIT:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        tid_t tid = *(tid_t *)(f->esp + 4);
-        f->eax = process_wait(tid);
-        break;
-
-    case SYS_CREATE:
-        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8)) {
-            force_exit(-1);
-        }
-        const char *file_create = *(const char **)(f->esp + 4);
-        unsigned initial_size = *(unsigned *)(f->esp + 8);
-        if (!validate_string(file_create)) {
-            force_exit(-1);
-        }
-        lock_acquire(&filesys_lock);
-        f->eax = filesys_create(file_create, initial_size);
-        lock_release(&filesys_lock);
-        break;
-
-    case SYS_REMOVE:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        const char *file_remove = *(const char **)(f->esp + 4);
-        if (!validate_string(file_remove)) {
-            force_exit(-1);
-        }
-        lock_acquire(&filesys_lock);
-        f->eax = filesys_remove(file_remove);
-        lock_release(&filesys_lock);
-        break;
-
-    case SYS_OPEN:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        const char *file_open = *(const char **)(f->esp + 4);
-        if (!validate_string(file_open)) {
-            force_exit(-1);
-        }
-        
-        lock_acquire(&filesys_lock);
-        struct file *file_obj = filesys_open(file_open);
-        lock_release(&filesys_lock);
-
-        if (file_obj == NULL) {
-            f->eax = -1;
-        } else {
-            struct thread *cur = thread_current();
-            if (cur->next_fd < FDT_SIZE) {
-                cur->fd_table[cur->next_fd] = file_obj;
-                f->eax = cur->next_fd;
-                cur->next_fd++;
-            } else {
-                file_close(file_obj);
-                f->eax = -1;
-            }
-        }
-        break;
-
-    case SYS_FILESIZE:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        int fd_size = *(int *)(f->esp + 4);
-        if (fd_size < 2 || fd_size >= FDT_SIZE) {
-            f->eax = -1;
-        } else {
-            struct thread *cur = thread_current();
-            if (cur->fd_table[fd_size] == NULL) {
-                f->eax = -1;
-            } else {
-                lock_acquire(&filesys_lock);
-                f->eax = file_length(cur->fd_table[fd_size]);
-                lock_release(&filesys_lock);
-            }
-        }
-        break;
-
-    case SYS_READ:
-        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8) || !validate_address(f->esp + 12)) {
-            force_exit(-1);
-        }
-        int fd_read = *(int *)(f->esp + 4);
-        void *buffer_read = *(void **)(f->esp + 8);
-        unsigned size_read = *(unsigned *)(f->esp + 12);
-        if (!validate_buffer(buffer_read, size_read)) force_exit(-1);
-
-        if (fd_read == 0) {
-            unsigned i;
-            uint8_t *local_buffer = (uint8_t *) buffer_read;
-            for (i = 0; i < size_read; i++) {
-                local_buffer[i] = input_getc();
-            }
-            f->eax = i;
-        } else if (fd_read < 2 || fd_read >= FDT_SIZE) {
-            f->eax = -1;
-        } else {
-            struct thread *cur = thread_current();
-            lock_acquire(&filesys_lock);
-            if (cur->fd_table[fd_read] == NULL) {
-                f->eax = -1;
-            } else {
-                f->eax = file_read(cur->fd_table[fd_read], buffer_read, size_read);
-            }
-            lock_release(&filesys_lock);
-        }
-        break;
-
-    case SYS_WRITE:
-        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8) || !validate_address(f->esp + 12)) {
-            force_exit(-1);
-        }
-        int fd_write = *(int *)(f->esp + 4);
-        const void *buffer_write = *(const void **)(f->esp + 8);
-        unsigned size_write = *(unsigned *)(f->esp + 12);
-        if (!validate_buffer(buffer_write, size_write)) {
-            force_exit(-1);
-        }
-
-        if (fd_write == 1) { // STDOUT
-            putbuf(buffer_write, size_write);
-            f->eax = size_write;
-        } else if (fd_write < 2 || fd_write >= FDT_SIZE) { // 잘못된 fd
-            f->eax = -1;
-        } else {
-          struct thread *cur = thread_current();
-          struct file *file_to_write = cur->fd_table[fd_write];
-          if (file_to_write == NULL) { // 닫혔거나 없는 fd
-              f->eax = -1;
-          } else {
-            lock_acquire(&filesys_lock);
-            f->eax = file_write(file_to_write, buffer_write, size_write);
-            lock_release(&filesys_lock);
-          }
-      }
-        break;
-
-    case SYS_SEEK:
-      if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8)) {
-          force_exit(-1);
-      }
-      int fd_seek = *(int *)(f->esp + 4);
-      unsigned position = *(unsigned *)(f->esp + 8);
-      if (fd_seek >= 2 && fd_seek < FDT_SIZE) {
-          struct thread *cur = thread_current();
-          if (cur->fd_table[fd_seek] != NULL) {
-              lock_acquire(&filesys_lock);
-              file_seek(cur->fd_table[fd_seek], position);
-              lock_release(&filesys_lock);
-          }
-      }
-      break;
-
-    case SYS_TELL:
-      if (!validate_address(f->esp + 4)) {
-          force_exit(-1);
-      }
-      int fd_tell = *(int *)(f->esp + 4);
-      if (fd_tell < 2 || fd_tell >= FDT_SIZE) {
-          f->eax = -1;
-      } else {
-          struct thread *cur = thread_current();
-          if (cur->fd_table[fd_tell] == NULL) {
-              f->eax = -1;
-          } else {
-              lock_acquire(&filesys_lock);
-              f->eax = file_tell(cur->fd_table[fd_tell]);
-              lock_release(&filesys_lock);
-          }
-      }
-      break;
-
-    case SYS_CLOSE:
-      if (!validate_address(f->esp + 4)) {
-          force_exit(-1);
-      }
-      int fd_close = *(int *)(f->esp + 4);
-      if (fd_close < 2 || fd_close >= FDT_SIZE) {
-          force_exit(-1);
-      }
-      if (cur->fd_table[fd_close] == NULL) {
-          force_exit(-1);
-      }
-      lock_acquire(&filesys_lock);
-      file_close(cur->fd_table[fd_close]);
-      lock_release(&filesys_lock);
-      cur->fd_table[fd_close] = NULL;
-      break;
-
-    case SYS_MMAP:
-        if (!validate_address(f->esp + 4) || !validate_address(f->esp + 8)) {
-            force_exit(-1);
-        }
-        int fd_mmap = *(int *)(f->esp + 4);
-        void *addr_mmap = *(void **)(f->esp + 8);
-        
-        f->eax = mmap(fd_mmap, addr_mmap);
-        break;
-        
-    case SYS_MUNMAP:
-        if (!validate_address(f->esp + 4)) {
-            force_exit(-1);
-        }
-        mapid_t mapid_munmap = *(mapid_t *)(f->esp + 4);
-        munmap(mapid_munmap);
-        f->eax = 0; // 성공 시 0 반환
-        break;
-
-    default:
-      force_exit(-1);
-      break;
-  }
-  unpin_all_frames();
 }

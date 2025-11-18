@@ -154,44 +154,30 @@ page_fault (struct intr_frame *f)
   struct thread *cur = thread_current();
 
   if (!user) {
-        /* * 만약 커널 모드 폴트가 '또' 발생했다면, 
-         * 우리가 validate_를 빠뜨린 커널 버그입니다.
-         * (이전 PANIC 대신 force_exit으로 우선 처리)
-         */
         force_exit(-1);
         return;
     }
 
-    /* * 2. (user == true) 오직 유저 모드 폴트만 처리 
-     * (e.g. 유저 프로그램이 'mov' 명령 실행)
-     */
     void *fault_page = pg_round_down(fault_addr);
     struct vm_entry *vme = vm_find (&cur->vm, fault_page);
 
     if (vme == NULL) {
-        /* 3. SPT에 없음 -> 잘못된 접근 
-         * (TODO: 스택 확장(Stack growth) 체크가 여기에 필요)
-         */
         if (!grow_stack(fault_addr, f->esp)) {
-            /* 2. 스택 확장이 아니거나 실패하면 종료 */
             force_exit(-1);
         }
         return;
     }
 
-    /* 4. 쓰기 금지 페이지에 쓰기 시도 */
     if (write && !vme->writable) {
         force_exit(-1);
         return;
     }
 
-    /* 5. SPT에 있음 -> 지연 로딩 (load_page 호출) */
     if (!load_page (vme)) {
         force_exit(-1);
         return;
     }
 
-    /* 6. 로드 성공. 리턴하면 CPU가 실패했던 명령 재시도 */
     return;
 
   /*printf ("Page fault at %p: %s error %s page in %s context.\n",

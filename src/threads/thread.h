@@ -119,11 +119,10 @@ struct thread
     struct file *executable_file;
 #endif
 
-   /* === VM (Project 3) === */
-    struct hash vm; /* 보조 페이지 테이블 (SPT) */
+    struct hash vm;
     void *user_esp;
-    /* ====================== */
     int next_mapid;
+    struct lock spt_lock;
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
