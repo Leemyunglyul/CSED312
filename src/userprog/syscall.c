@@ -218,38 +218,44 @@ munmap (mapid_t mapid)
 {
     struct thread *cur = thread_current();
     struct hash *vm = &cur->vm;
-    
     struct hash_iterator i;
     struct file *file_to_close = NULL; 
-    bool found = false;
 
-    hash_first (&i, vm);
-    while (hash_next (&i))
-    {
-        struct vm_entry *vme = hash_entry (hash_cur (&i), struct vm_entry, elem);
-
-        if (vme->type == VM_FILE && vme->mapid == mapid) 
-        {
-            if (file_to_close == NULL) {
-                file_to_close = vme->file; 
+    /* [수정 1] 루프를 돌면서 삭제하면 안 되므로, 
+       '삭제할 대상이 없을 때까지' 반복해서 처음부터 찾습니다. */
+    while (true) {
+        struct vm_entry *target_vme = NULL;
+        
+        hash_first(&i, vm);
+        while (hash_next(&i)) {
+            struct vm_entry *vme = hash_entry(hash_cur(&i), struct vm_entry, elem);
+            if (vme->type == VM_FILE && vme->mapid == mapid) {
+                target_vme = vme;
+                break; // 대상을 찾으면 탐색 중단
             }
-            
-            vm_munmap_page(vme); // Write-back 및 프레임 해제
-            
-            hash_delete (vm, &vme->elem);
-            hash_first(&i, vm); // 반복자 리셋
-            free (vme);
-            found = true;
         }
+
+        if (target_vme == NULL) {
+            break; // 더 이상 지울 게 없으면 종료
+        }
+
+        /* 파일을 닫기 위해 포인터 저장 (모든 페이지가 공유하므로 하나만 알면 됨) */
+        if (file_to_close == NULL) {
+            file_to_close = target_vme->file;
+        }
+
+        /* 페이지 정리 및 삭제 */
+        vm_munmap_page(target_vme); 
+        hash_delete(vm, &target_vme->elem);
+        free(target_vme);
     }
-    
-    // 4. mmap이 reopen한 파일 닫기
-    if (file_to_close != NULL && found) {
+
+    /* [수정 2] 모든 페이지 해제가 끝난 후 안전하게 파일을 닫습니다. */
+    if (file_to_close != NULL) {
         lock_acquire(&filesys_lock);
         file_close(file_to_close);
         lock_release(&filesys_lock);
     }
-    // munmap은 성공/실패 코드를 반환하지 않습니다.
 }
 
 void

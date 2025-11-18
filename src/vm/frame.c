@@ -193,29 +193,32 @@ frame_do_swap_out (struct vm_entry *vme)
 void
 frame_free (void *kpage) 
 {
+    struct list_elem *e;
+    struct vm_entry *target_vme = NULL;
+
     lock_acquire (&frame_lock);
     
-    struct list_elem *e = list_begin (&frame_table);
+    e = list_begin (&frame_table);
     while (e != list_end (&frame_table)) 
     {
         struct vm_entry *vme = list_entry (e, struct vm_entry, f_elem);
         
         if (vme->kpage == kpage) {
-            
             if (clock_hand == e) {
                 clock_hand = list_next(e);
             }
-            /* ================== */
-
-            list_remove (e); // 요소 제거
-            palloc_free_page (kpage);
-            vme->kpage = NULL;
-            break; // 찾았으므로 루프 종료
+            list_remove (e);
+            target_vme = vme; // 해제할 대상만 기억
+            break;
         }
-        
-        /* [중요] 'for' 루프 대신 'while'과 수동 증가 사용 */
         e = list_next(e); 
     }
     
-    lock_release (&frame_lock);
+    lock_release (&frame_lock); // 여기서 락 해제
+
+    /* [수정] 락 밖에서 실제 물리 메모리 해제 */
+    if (target_vme != NULL) {
+        palloc_free_page (kpage);
+        target_vme->kpage = NULL;
+    }
 }

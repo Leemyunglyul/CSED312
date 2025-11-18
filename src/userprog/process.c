@@ -343,17 +343,20 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
+  lock_acquire(&filesys_lock);
   file = filesys_open (file_name);
   if (file == NULL) 
     {
+      lock_release(&filesys_lock); // [주의] 실패 시 락 해제
       printf ("load: %s: open failed\n", file_name);
       goto done; 
     }
 
   file_deny_write(file);
+  lock_release(&filesys_lock); // 오픈 완료 후 해제
   t->executable_file = file;
 
-
+  lock_acquire(&filesys_lock);
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -363,9 +366,11 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
       || ehdr.e_phnum > 1024) 
     {
+      lock_release(&filesys_lock);
       printf ("load: %s: error loading executable\n", file_name);
       goto done; 
     }
+  lock_release(&filesys_lock); // 헤더 읽기 완료 후 해제
 
   /* Read program headers. */
   file_ofs = ehdr.e_phoff;
@@ -375,10 +380,14 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
       if (file_ofs < 0 || file_ofs > file_length (file))
         goto done;
+      lock_acquire(&filesys_lock);
       file_seek (file, file_ofs);
 
-      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
+      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr) {
+        lock_release(&filesys_lock);
         goto done;
+      }
+      lock_release(&filesys_lock);
       file_ofs += sizeof phdr;
       switch (phdr.p_type) 
         {
