@@ -19,33 +19,28 @@ vm_munmap_page (struct vm_entry *vme)
     if (vme->is_loaded) {
         if (vme->type == VM_FILE && pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
             lock_acquire(&filesys_lock);
-
+            
+            /* 파일 끝 범위 체크 */
+            off_t write_bytes = vme->read_bytes;
             off_t file_len = file_length(vme->file);
-            off_t write_offset = vme->offset;
-            off_t write_len = vme->read_bytes;
-            
-            if (write_offset + write_len > file_len) {
-                 write_len = file_len - write_offset;
+            if (vme->offset + write_bytes > file_len) {
+                 write_bytes = file_len - vme->offset;
             }
             
-            if (write_len > 0) {
-                 file_write_at(vme->file, 
-                               vme->kpage, 
-                               write_len, 
-                               write_offset);
-                 
-                 pagedir_set_dirty(vme->thread->pagedir, vme->vaddr, false);
-            }
-
+            file_write_at(vme->file, vme->kpage, write_bytes, vme->offset);
+            
             lock_release(&filesys_lock);
         }
         
         pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
         frame_free(vme->kpage);
+
+        vme->is_loaded = false;
     }
     
     if (vme->swap_index != BITMAP_ERROR) {
         swap_free(vme->swap_index);
+        vme->swap_index = BITMAP_ERROR;
     }
 }
 
@@ -111,6 +106,7 @@ void
 vm_init (struct hash *vm)
 {
     hash_init (vm, vm_hash_func, vm_less_func, NULL);
+    //lock_init(&thread_current()->spt_lock);
 }
 
 struct vm_entry *
@@ -280,8 +276,10 @@ do_munmap_internal (mapid_t mapid)
                 }
                 lock_release(&filesys_lock);
             }
-            frame_free(target_vme->kpage);
             pagedir_clear_page(cur->pagedir, target_vme->vaddr);
+            frame_free(target_vme->kpage);
+            
+            target_vme->is_loaded = false;
         }
         
         hash_delete(vm, &target_vme->elem);

@@ -102,6 +102,10 @@ main (void)
   malloc_init ();
   paging_init ();
 
+#ifdef VM
+  vm_init (&thread_current ()->vm);
+  lock_init (&thread_current ()->spt_lock);
+#endif
   /* Segmentation. */
 #ifdef USERPROG
   tss_init ();

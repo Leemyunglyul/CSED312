@@ -182,6 +182,10 @@ thread_create (const char *name, int priority,
 
   /* Initialize thread. */
   init_thread (t, name, priority);
+  #ifdef VM
+    vm_init (&t->vm);
+    lock_init (&t->spt_lock);
+  #endif
   t->parent_tid = thread_current()->tid;
   tid = t->tid = allocate_tid ();
 

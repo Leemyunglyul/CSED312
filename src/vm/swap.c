@@ -1,21 +1,21 @@
 #include "vm/swap.h"
-#include "devices/block.h"    
+#include "devices/block.h"
 #include "lib/kernel/bitmap.h"
-#include "threads/vaddr.h"    
-#include "threads/synch.h"    
+#include "threads/vaddr.h"
+#include "threads/synch.h"
 
 static struct block *swap_disk;
 static struct bitmap *swap_table;
 static struct lock swap_lock;
 
-#define SECTORS_PER_PAGE (PGSIZE / BLOCK_SECTOR_SIZE) 
+#define SECTORS_PER_PAGE (PGSIZE / BLOCK_SECTOR_SIZE)
 
 void
 swap_init (void) 
 {
     swap_disk = block_get_role (BLOCK_SWAP);
     if (swap_disk == NULL) {
-        PANIC ("Swap disk not found, use --swap-size option."); 
+        return;
     }
 
     size_t swap_slots = block_size (swap_disk) / SECTORS_PER_PAGE;
@@ -33,11 +33,10 @@ swap_out (void *kpage)
     ASSERT (swap_disk != NULL && swap_table != NULL);
 
     lock_acquire (&swap_lock);
-
     size_t free_index = bitmap_scan_and_flip (swap_table, 0, 1, false);
+    lock_release (&swap_lock); 
 
     if (free_index == BITMAP_ERROR) {
-        lock_release (&swap_lock);
         return BITMAP_ERROR;
     }
 
@@ -47,7 +46,6 @@ swap_out (void *kpage)
                      kpage + (i * BLOCK_SECTOR_SIZE));
     }
 
-    lock_release (&swap_lock);
     return free_index;
 }
 
@@ -57,19 +55,18 @@ swap_in (size_t swap_index, void *kpage)
     ASSERT (swap_disk != NULL && swap_table != NULL);
 
     lock_acquire (&swap_lock);
-
     if (!bitmap_test (swap_table, swap_index)) {
         lock_release (&swap_lock);
-        PANIC ("Invalid swap slot index read attempt!");
+        // 이미 비어있는 슬롯을 읽으려 하면 에러 (Logic Bug)
+        PANIC ("Invalid swap slot index read attempt: %zu", swap_index);
     }
-
+    lock_release (&swap_lock);
     for (int i = 0; i < SECTORS_PER_PAGE; i++) {
         block_read (swap_disk, 
                     (swap_index * SECTORS_PER_PAGE) + i, 
                     kpage + (i * BLOCK_SECTOR_SIZE));
     }
     
-    lock_release (&swap_lock);
 }
 
 void

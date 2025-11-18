@@ -2,61 +2,54 @@
 #define VM_PAGE_H
 
 #include <hash.h>
+#include <list.h>
+#include "threads/thread.h"
 #include "filesys/file.h"
 #include "userprog/syscall.h"
 
-
-/* 페이지의 상태(위치)를 나타내는 타입 */
+/* 페이지 타입 */
 enum vm_type {
-    VM_BIN,  /* 실행 파일 (디스크) */
-    VM_ANON, /* 스택, 0으로 채워진 페이지 (Swap 대상) */
-    VM_FILE  /* 메모리 맵 파일 (mmap) */
+    VM_BIN,   /* 바이너리 실행 파일 (Code/Data) */
+    VM_FILE,  /* 메모리 맵 파일 (mmap) */
+    VM_ANON   /* 스택, 힙, 스왑 영역 (Anonymous) */
 };
 
+/* 가상 메모리 항목 (Page Table Entry 역할) */
 struct vm_entry {
     enum vm_type type;
-    void *vaddr;
-    bool writable;
-    bool is_loaded;
+    void *vaddr;            /* 가상 주소 (Page Aligned) */
+    bool writable;          /* 쓰기 가능 여부 */
     
-    struct file *file;
-    off_t offset;
-    size_t read_bytes;
-    size_t zero_bytes;
+    bool is_loaded;         /* 물리 메모리에 로드되었는지 여부 */
+    void *kpage;            /* 매핑된 물리 프레임 주소 (is_loaded=true일 때 유효) */
     
-    size_t swap_index;
-
-    struct hash_elem elem;  /* SPT(해시 테이블)용 elem */
+    struct file *file;      /* [VM_FILE/VM_BIN] 연관된 파일 */
+    off_t offset;           /* 파일 내 오프셋 */
+    size_t read_bytes;      /* 파일에서 읽을 바이트 수 */
+    size_t zero_bytes;      /* 0으로 채울 바이트 수 */
     
-    /* === [추가: Frame Table 통합] === */
-    void *kpage;            /* 프레임 주소 (로드되었을 때만) */
-    struct list_elem f_elem; /* 프레임 테이블(list)용 elem */
-    /* ============================== */
-    struct thread *thread;
-    bool pinned;
-    mapid_t mapid;
+    size_t swap_index;      /* [VM_ANON] 스왑 슬롯 인덱스 */
+    
+    struct hash_elem elem;  /* Thread의 vm(해시 테이블) 연결용 */
+    struct list_elem f_elem; /* Frame Table 연결용 (Back-pointer) */
+    
+    struct thread *thread;  /* 소유자 스레드 */
+    bool pinned;            /* 교체(Evict) 방지 플래그 */
+    mapid_t mapid;          /* [VM_FILE] mmap 식별자 */
 };
 
-
-
-/* SPT(해시 테이블) 초기화 */
+/* 함수 프로토타입 */
 void vm_init (struct hash *vm);
-/* SPT(해시 테이블) 전체 삭제 */
 void vm_destroy (struct hash *vm);
 
-/* 가상 주소(vaddr)로 SPT 항목(vm_entry) 찾기 */
 struct vm_entry *vm_find (struct hash *vm, void *vaddr);
-/* SPT에 항목(vm_entry) 추가 */
 bool vm_insert (struct hash *vm, struct vm_entry *vme);
-/* SPT에서 항목(vm_entry) 제거 */
 bool vm_delete (struct hash *vm, struct vm_entry *vme);
 
-/* 페이지 폴트 시 호출될 핸들러 (데이터 로딩) */
 bool load_page (struct vm_entry *vme);
-
 bool grow_stack (void *fault_addr, void *esp);
 
-void munmap_process_exit (void);
 void vm_munmap_page (struct vm_entry *vme);
+void munmap_process_exit (void);
 
 #endif /* vm/page.h */

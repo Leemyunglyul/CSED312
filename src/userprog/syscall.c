@@ -402,7 +402,7 @@ static void munmap (mapid_t mapid) {
                 
                 if (write_len > 0) {
                     file_write_at(target_vme->file, 
-                                   target_vme->kpage + (target_vme->offset % PGSIZE), 
+                                   target_vme->kpage, 
                                    write_len, 
                                    write_offset);
                      
@@ -410,8 +410,8 @@ static void munmap (mapid_t mapid) {
                 }
                 lock_release(&filesys_lock);
             }
-            frame_free(target_vme->kpage);
             pagedir_clear_page(cur->pagedir, target_vme->vaddr);
+            frame_free(target_vme->kpage);
         }
         hash_delete(vm, &target_vme->elem);
         free(target_vme);

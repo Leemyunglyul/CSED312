@@ -3,7 +3,7 @@
 
 #include <list.h>
 #include "threads/palloc.h"
-#include "threads/thread.h"
+#include "threads/synch.h" 
 #include "vm/page.h"
 
 void frame_init (void);
