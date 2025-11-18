@@ -17,10 +17,13 @@ void
 vm_munmap_page (struct vm_entry *vme)
 {
     if (vme->is_loaded) {
-        if (vme->type == VM_FILE && pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
+        /* 1. Dirty 확인 (매핑 끊기 전에 확인 필수!) */
+        bool is_dirty = pagedir_is_dirty(vme->thread->pagedir, vme->vaddr);
+        
+        /* 2. 파일 매핑이고 Dirty라면 파일에 기록 */
+        if (vme->type == VM_FILE && is_dirty) {
             lock_acquire(&filesys_lock);
             
-            /* 파일 끝 범위 체크 */
             off_t write_bytes = vme->read_bytes;
             off_t file_len = file_length(vme->file);
             if (vme->offset + write_bytes > file_len) {
@@ -32,12 +35,17 @@ vm_munmap_page (struct vm_entry *vme)
             lock_release(&filesys_lock);
         }
         
+        /* 3. 매핑 해제 */
         pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
+        
+        /* 4. 프레임 반환 */
         frame_free(vme->kpage);
-
+        
         vme->is_loaded = false;
+        vme->kpage = NULL;
     }
     
+    /* 스왑 슬롯 해제 */
     if (vme->swap_index != BITMAP_ERROR) {
         swap_free(vme->swap_index);
         vme->swap_index = BITMAP_ERROR;

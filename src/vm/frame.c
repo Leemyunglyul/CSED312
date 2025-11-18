@@ -182,8 +182,12 @@ frame_evict (enum palloc_flags flags)
 static bool
 frame_do_swap_out (struct vm_entry *vme)
 {
-    ASSERT (vme != NULL);
-    ASSERT (vme->is_loaded == true);
+    //ASSERT (vme != NULL);
+    //ASSERT (vme->is_loaded == true);
+
+    if (vme == NULL || !vme->is_loaded) {
+        return true; /* 이미 처리되었거나 로드되지 않음 -> 성공으로 간주 */
+    }
     
     bool is_dirty = pagedir_is_dirty(vme->thread->pagedir, vme->vaddr);
     

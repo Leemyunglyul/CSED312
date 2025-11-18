@@ -593,51 +593,46 @@ setup_stack (void **esp)
     void *stack_upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
     struct thread *cur = thread_current();
     
-    /* [수정] vme를 먼저 찾거나 생성 (malloc 1번) */
+    /* 1. VM Entry 생성 */
     struct vm_entry *vme = vm_find (&cur->vm, stack_upage);
     if (vme == NULL) {
         vme = malloc(sizeof(struct vm_entry));
-        if (vme == NULL) return false; // malloc 실패
+        if (vme == NULL) return false;
 
         vme->type = VM_ANON;
         vme->vaddr = stack_upage;
         vme->writable = true;
-        vme->is_loaded = true; // (이제 로드할 것임)
+        vme->is_loaded = false; /* [중요] 아직 로드 안 됨! */
         vme->file = NULL;
-        vme->thread = thread_current();
-        vme->swap_index = BITMAP_ERROR; // 스왑 없음
-        vme->pinned = false;
+        vme->thread = cur;
+        vme->swap_index = BITMAP_ERROR;
+        vme->pinned = true; /* 스택 할당 도중엔 교체되지 않도록 고정 */
         
         if (!vm_insert (&cur->vm, vme)) {
             free(vme);
             return false;
         }
-    } else {
-        vme->is_loaded = true;
-        vme->type = VM_ANON; 
-        vme->writable = true;
     }
 
-    /* [수정] frame_alloc에 vme 전달 */
+    /* 2. 물리 프레임 할당 */
     uint8_t *kpage = frame_alloc (vme, PAL_USER | PAL_ZERO);
     if (kpage == NULL) {
-        /* * 롤백: vme는 SPT에 남겨두고 'not_loaded'로 되돌림
-         * * (혹은 vm_delete 호출) 
-         */
-        vme->is_loaded = false; 
         return false;
     }
     
+    /* 3. 페이지 테이블 매핑 */
     success = install_page (stack_upage, kpage, true);
-    if (!success)
-    {
+    if (success) {
+        vme->is_loaded = true; /* 매핑 성공 후에 true로 설정 */
+        vme->kpage = kpage;
+        *esp = PHYS_BASE;
+        vme->pinned = false; /* 고정 해제 */
+    } else {
         frame_free (kpage);
-        vme->is_loaded = false;
-        return false;
+        /* 매핑 실패 시 vme는 남겨두거나 삭제 */
     }
     
-    *esp = PHYS_BASE;
-    return true; /* 성공 */
+    return success;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
