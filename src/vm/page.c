@@ -22,7 +22,9 @@ vm_munmap_page (struct vm_entry *vme)
         
         /* 2. 파일 매핑이고 Dirty라면 파일에 기록 */
         if (vme->type == VM_FILE && is_dirty) {
-            lock_acquire(&filesys_lock);
+            /* [수정] 락 보유 여부 확인 후 acquire/release */
+            bool lock_held = lock_held_by_current_thread(&filesys_lock);
+            if (!lock_held) lock_acquire(&filesys_lock);
             
             off_t write_bytes = vme->read_bytes;
             off_t file_len = file_length(vme->file);
@@ -33,7 +35,7 @@ vm_munmap_page (struct vm_entry *vme)
             
             file_write_at(vme->file, vme->kpage, write_bytes, vme->offset);
             
-            lock_release(&filesys_lock);
+            if (!lock_held) lock_release(&filesys_lock);
         }
         
         /* 3. 매핑 해제 */
