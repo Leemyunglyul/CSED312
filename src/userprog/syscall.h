@@ -5,7 +5,7 @@
 
 typedef int mapid_t;
 
-extern struct lock filesys_lock;
+struct lock* get_filesys_lock(void);
 
 void syscall_init (void);
 void force_exit (int status);

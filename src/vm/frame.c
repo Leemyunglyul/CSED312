@@ -12,8 +12,6 @@
 #include "filesys/file.h"
 #include "userprog/syscall.h"
 
-extern struct lock filesys_lock;
-
 /* 프레임 테이블 관리 변수 */
 static struct list frame_table;
 static struct lock frame_lock;
@@ -213,8 +211,8 @@ frame_do_swap_out (struct vm_entry *vme)
     if (vme->type == VM_FILE) {
         if (is_dirty) {
             /* [수정] 락 보유 여부 확인 후 acquire/release */
-            bool lock_held = lock_held_by_current_thread(&filesys_lock);
-            if (!lock_held) lock_acquire(&filesys_lock);
+            struct lock *filesys_lock = get_filesys_lock();
+            lock_acquire(filesys_lock);
             
             off_t file_len = file_length(vme->file);
             off_t write_bytes = vme->read_bytes;
@@ -223,7 +221,7 @@ frame_do_swap_out (struct vm_entry *vme)
                 
             file_write_at(vme->file, vme->kpage, write_bytes, vme->offset);
             
-            if (!lock_held) lock_release(&filesys_lock);
+            lock_release(filesys_lock);
         }
         
         pagedir_clear_page(vme->thread->pagedir, vme->vaddr);

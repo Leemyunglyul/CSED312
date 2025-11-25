@@ -20,15 +20,20 @@
 #include <hash.h>
 
 static void syscall_handler (struct intr_frame *);
-struct lock filesys_lock;
+
+static struct lock filesys_lock;
+
+struct lock* get_filesys_lock(void) {
+    return &filesys_lock;
+}
 
 void force_exit(int status) {
     struct thread *cur = thread_current();
     cur->exit_status = status;
     printf("%s: exit(%d)\n", cur->name, status);
 
-    sema_up(&cur->wait_sema);
-    sema_down(&cur->free_sema);
+    //sema_up(&cur->wait_sema);
+    //sema_down(&cur->free_sema);
 
     thread_exit();
 }

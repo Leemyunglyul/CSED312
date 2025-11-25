@@ -22,6 +22,7 @@ struct lock
   {
     struct thread *holder;      /* Thread holding lock (for debugging). */
     struct semaphore semaphore; /* Binary semaphore controlling access. */
+    int recursion_cnt;          /* [추가] 재진입 횟수 카운터 */
   };
 
 void lock_init (struct lock *);

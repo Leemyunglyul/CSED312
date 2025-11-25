@@ -11,44 +11,48 @@
 
 #define STACK_MAX_SIZE (8 * 1024 * 1024)
 
-extern struct lock filesys_lock;
-
 void
 vm_munmap_page (struct vm_entry *vme)
 {
     if (vme->is_loaded) {
-        /* 1. Dirty 확인 (매핑 끊기 전에 확인 필수!) */
+        /* Dirty 비트 확인 */
         bool is_dirty = pagedir_is_dirty(vme->thread->pagedir, vme->vaddr);
         
-        /* 2. 파일 매핑이고 Dirty라면 파일에 기록 */
+        /* [디버깅] mmap 페이지 해제 시 상태 출력 */
+        /*if (vme->type == VM_FILE) {
+             printf("DEBUG: munmap vaddr=%p, type=FILE, dirty=%d\n", 
+                    vme->vaddr, is_dirty);
+        }*/
+
         if (vme->type == VM_FILE && is_dirty) {
-            /* [수정] 락 보유 여부 확인 후 acquire/release */
-            bool lock_held = lock_held_by_current_thread(&filesys_lock);
-            if (!lock_held) lock_acquire(&filesys_lock);
             
+            struct lock *fs_lock = get_filesys_lock();
+            bool lock_was_held = lock_held_by_current_thread(fs_lock);
+            
+            if (!lock_was_held) lock_acquire(fs_lock);
+            
+            /* 쓰기 크기 계산 */
             off_t write_bytes = vme->read_bytes;
             off_t file_len = file_length(vme->file);
-            
             if (vme->offset + write_bytes > file_len) {
                  write_bytes = file_len - vme->offset;
             }
             
-            file_write_at(vme->file, vme->kpage, write_bytes, vme->offset);
+            /* 파일 쓰기 수행 및 결과 확인 */
+            off_t written = file_write_at(vme->file, vme->kpage, write_bytes, vme->offset);
             
-            if (!lock_held) lock_release(&filesys_lock);
+            //printf("DEBUG: file_write_at result=%d, expected=%d\n", (int)written, (int)write_bytes);
+
+            if (!lock_was_held) lock_release(fs_lock);
         }
         
-        /* 3. 매핑 해제 */
         pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
-        
-        /* 4. 프레임 반환 */
         frame_free(vme->kpage);
         
         vme->is_loaded = false;
         vme->kpage = NULL;
     }
     
-    /* 스왑 슬롯 해제 */
     if (vme->swap_index != BITMAP_ERROR) {
         swap_free(vme->swap_index);
         vme->swap_index = BITMAP_ERROR;
@@ -184,20 +188,23 @@ load_page (struct vm_entry *vme)
     void *kpage = frame_alloc (vme, PAL_USER | PAL_ZERO);
     if (kpage == NULL) return false;
 
-    bool lock_held = lock_held_by_current_thread(&filesys_lock);
+    struct lock *filesys_lock = get_filesys_lock();
 
     if (vme->type == VM_BIN || vme->type == VM_FILE) {
         if (vme->swap_index == BITMAP_ERROR) {
-             if (!lock_held) lock_acquire(&filesys_lock);
+            lock_acquire(filesys_lock);
              
-             if (file_read_at(vme->file, kpage + (vme->offset % PGSIZE), 
-                              vme->read_bytes, vme->offset) != (int)vme->read_bytes) {
-                 if (!lock_held) lock_release(&filesys_lock);
-                 frame_free(kpage);
-                 return false;
+             /* 파일 읽기 시도 */
+             int read_bytes = file_read_at(vme->file, kpage + (vme->offset % PGSIZE), 
+                                           vme->read_bytes, vme->offset);
+             
+             /* 읽기 후, 내가 잡았던 락이라면 해제 */
+            lock_release(filesys_lock);
+
+             if (read_bytes != (int)vme->read_bytes) {
+                  frame_free(kpage);
+                  return false;
              }
-             
-             if (!lock_held) lock_release(&filesys_lock);
         } else {
             swap_in(vme->swap_index, kpage);
             swap_free(vme->swap_index);
@@ -216,29 +223,4 @@ load_page (struct vm_entry *vme)
     vme->is_loaded = true;
     vme->swap_index = BITMAP_ERROR;
     return true;
-}
-
-static void
-munmap_helper (struct hash_elem *e, void *aux)
-{
-    mapid_t *mapid = (mapid_t *)aux;
-    struct vm_entry *vme = hash_entry(e, struct vm_entry, elem);
-
-    if (vme->type == VM_FILE && vme->mapid == *mapid) {
-        
-        if (vme->is_loaded) {
-            if (pagedir_is_dirty(vme->thread->pagedir, vme->vaddr)) {
-                lock_acquire(&filesys_lock);
-                file_write_at(vme->file, 
-                              vme->kpage, 
-                              vme->read_bytes, 
-                              vme->offset);
-                lock_release(&filesys_lock);
-            }
-            frame_free(vme->kpage);
-            pagedir_clear_page(vme->thread->pagedir, vme->vaddr);
-        }
-        
-        
-    }
 }
