@@ -11,6 +11,7 @@ PINTOS 2(project2-skel branch): 80/80 ALL PASSED 🎉
 - Argument Passing
 - System Calls
 - Denying Writes to Executables
+
 **Based on Skeleton code, not PINTOS 1.**
 
 PINTOS 3(project3 branch): 113/113 ALL PASSED 🎉
@@ -21,4 +22,5 @@ PINTOS 3(project3 branch): 113/113 ALL PASSED 🎉
 - File Memory Mapping
 - Swap Table
 - On Process Termination
+  
 **Based on PINTOS 2.**
