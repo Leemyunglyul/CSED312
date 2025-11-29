@@ -143,7 +143,7 @@ page_fault (struct intr_frame *f)
      be assured of reading CR2 before it changed). */
   intr_enable ();
 
-  /* Count page faults. */
+  /* Count page faults. */ 
   page_fault_cnt++;
 
   /* Determine cause. */
@@ -151,51 +151,36 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
 
-  if (is_kernel_vaddr(fault_addr)) {
+   if (is_kernel_vaddr(fault_addr)) {
         force_exit(-1);
     }
     
-    /* 2. 권한 위반 (존재하지만 Read-only에 쓰려고 함) -> 즉시 종료 */
-    if (!not_present) {
+   if (!not_present) {
         force_exit(-1);
     }
 
     struct thread *cur = thread_current();
     
-    /* 3. 스택 확장 (Stack Growth) 체크 */
-    /* 유저 모드면 f->esp, 커널 모드(syscall 중)면 cur->user_esp 사용 */
     void *esp = user ? f->esp : cur->user_esp;
     
-    /* 스택 포인터 유효성 검사 (Heuristic: esp - 32 바이트까지 허용) */
     if (fault_addr >= esp - 32) {
         if (grow_stack(fault_addr, esp)) {
-            return; /* 스택 확장 및 로딩 성공 -> 재실행 */
+            return;
         }
     }
 
-    /* 4. Lazy Loading (SPT에서 찾아서 로딩) */
     struct vm_entry *vme = vm_find(&cur->vm, fault_addr);
     
     if (vme != NULL) {
-        /* Write 요청인데 Read-only 페이지인 경우 */
         if (write && !vme->writable) {
            force_exit(-1);
         }
         
-        /* 물리 메모리에 로딩 */
         if (load_page(vme)) {
-            return; /* 성공 -> 재실행 */
+            return; 
         }
     }
 
-    /* 5. 위 모든 방법으로 해결 안 됨 -> 진짜 잘못된 접근 */
     force_exit(-1);
-
-  /*printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);*/
 }
 

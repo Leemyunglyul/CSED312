@@ -15,15 +15,8 @@ void
 vm_munmap_page (struct vm_entry *vme)
 {
     if (vme->is_loaded) {
-        /* Dirty 비트 확인 */
         bool is_dirty = pagedir_is_dirty(vme->thread->pagedir, vme->vaddr);
         
-        /* [디버깅] mmap 페이지 해제 시 상태 출력 */
-        /*if (vme->type == VM_FILE) {
-             printf("DEBUG: munmap vaddr=%p, type=FILE, dirty=%d\n", 
-                    vme->vaddr, is_dirty);
-        }*/
-
         if (vme->type == VM_FILE && is_dirty) {
             
             struct lock *fs_lock = get_filesys_lock();
@@ -31,18 +24,14 @@ vm_munmap_page (struct vm_entry *vme)
             
             if (!lock_was_held) lock_acquire(fs_lock);
             
-            /* 쓰기 크기 계산 */
             off_t write_bytes = vme->read_bytes;
             off_t file_len = file_length(vme->file);
             if (vme->offset + write_bytes > file_len) {
                  write_bytes = file_len - vme->offset;
             }
             
-            /* 파일 쓰기 수행 및 결과 확인 */
             off_t written = file_write_at(vme->file, vme->kpage, write_bytes, vme->offset);
             
-            //printf("DEBUG: file_write_at result=%d, expected=%d\n", (int)written, (int)write_bytes);
-
             if (!lock_was_held) lock_release(fs_lock);
         }
         
@@ -121,7 +110,6 @@ void
 vm_init (struct hash *vm)
 {
     hash_init (vm, vm_hash_func, vm_less_func, NULL);
-    //lock_init(&thread_current()->spt_lock);
 }
 
 struct vm_entry *
@@ -163,10 +151,6 @@ vm_destroy_func (struct hash_elem *e, void *aux UNUSED)
 {
     struct vm_entry *vme = hash_entry (e, struct vm_entry, elem);
 
-    /*if (vme->is_loaded || vme->swap_index != BITMAP_ERROR) {
-        vm_munmap_page(vme);
-    }*/
-
     vm_munmap_page(vme);
     
     free (vme);
@@ -194,11 +178,9 @@ load_page (struct vm_entry *vme)
         if (vme->swap_index == BITMAP_ERROR) {
             lock_acquire(filesys_lock);
              
-             /* 파일 읽기 시도 */
              int read_bytes = file_read_at(vme->file, kpage + (vme->offset % PGSIZE), 
                                            vme->read_bytes, vme->offset);
              
-             /* 읽기 후, 내가 잡았던 락이라면 해제 */
             lock_release(filesys_lock);
 
              if (read_bytes != (int)vme->read_bytes) {

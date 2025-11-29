@@ -17,7 +17,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "userprog/syscall.h" /* [필수] get_filesys_lock 선언 포함 */
+#include "userprog/syscall.h"
 #include "vm/frame.h"
 #include "vm/page.h"
 #include "lib/kernel/bitmap.h"
@@ -172,16 +172,10 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  /* 1. 락 포인터 가져오기 */
   struct lock *fs_lock = get_filesys_lock();
   
-  
-  /* 3. VM 정리 (내부적으로 파일 쓰기가 발생할 수 있음) */
-  /* 주의: vm_destroy는 각 페이지별로 lock 로직이(vm/page.c) 들어있으므로 
-     여기서 락을 잡고 들어가면 안 됩니다. */
   vm_destroy (&cur->vm);
 
-  /* 4. 파일 닫기 - 여기서 락이 필요함 */
   lock_acquire(fs_lock);
 
   if (cur->executable_file != NULL) {
@@ -196,7 +190,6 @@ process_exit (void)
       }
   }
 
-  /* 내가 잡았을 때만 해제합니다. */
   lock_release(fs_lock);
 
   sema_up(&cur->wait_sema);
@@ -230,7 +223,6 @@ process_activate (void)
   tss_update ();
 }
 
-/* ELF headers ... (생략된 구조체들은 헤더에 있으므로 코드상 문제 없음) */
 typedef uint32_t Elf32_Word, Elf32_Addr, Elf32_Off;
 typedef uint16_t Elf32_Half;
 #define PE32Wx PRIx32 
@@ -302,7 +294,6 @@ load (const char *file_name, void (**eip) (void), void **esp)
     goto done;
   process_activate ();
 
-  /* [수정] get_filesys_lock 사용 */
   struct lock *fs_lock = get_filesys_lock();
 
   lock_acquire(fs_lock);
@@ -388,7 +379,6 @@ load (const char *file_name, void (**eip) (void), void **esp)
   success = true;
 
  done:
-  /* load 실패 시에는 process_exit에서 파일 정리하므로 여기서 닫을 필요 없음 */
   return success;
 }
 

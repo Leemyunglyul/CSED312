@@ -38,7 +38,6 @@ struct vm_entry {
     mapid_t mapid;          /* [VM_FILE] mmap 식별자 */
 };
 
-/* 함수 프로토타입 */
 void vm_init (struct hash *vm);
 void vm_destroy (struct hash *vm);
 
@@ -51,4 +50,4 @@ bool grow_stack (void *fault_addr, void *esp);
 
 void vm_munmap_page (struct vm_entry *vme);
 
-#endif /* vm/page.h */
+#endif

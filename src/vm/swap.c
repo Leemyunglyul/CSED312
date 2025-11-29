@@ -57,7 +57,6 @@ swap_in (size_t swap_index, void *kpage)
     lock_acquire (&swap_lock);
     if (!bitmap_test (swap_table, swap_index)) {
         lock_release (&swap_lock);
-        // 이미 비어있는 슬롯을 읽으려 하면 에러 (Logic Bug)
         PANIC ("Invalid swap slot index read attempt: %zu", swap_index);
     }
     lock_release (&swap_lock);
@@ -66,7 +65,6 @@ swap_in (size_t swap_index, void *kpage)
                     (swap_index * SECTORS_PER_PAGE) + i, 
                     kpage + (i * BLOCK_SECTOR_SIZE));
     }
-    
 }
 
 void
